@@ -1,0 +1,10 @@
+{
+  "name": "eson",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @eson/desktop dev",
+    "build": "pnpm --filter @eson/desktop build",
+    "tauri": "pnpm --filter @eson/desktop tauri"
+  },
+  "packageManager": "pnpm@9.15.0"
+}

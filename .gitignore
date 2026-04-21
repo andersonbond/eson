@@ -1,0 +1,43 @@
+# Env
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Frontend build
+apps/desktop/.svelte-kit/
+apps/desktop/build/
+apps/desktop/dist/
+
+# Tauri
+apps/desktop/src-tauri/target/
+# Sidecar binaries + bundled resources are produced by scripts/build-installer.sh
+apps/desktop/src-tauri/binaries/
+apps/desktop/src-tauri/resources/
+
+# Agent drafts / local learnings
+skills/auto/
+workspace/.learnings/
+
+# Workspace data (keep structure; ignore local DBs and logs)
+workspace/db/*.db
+workspace/db/*.db-*
+workspace/db/background_settings.json
+workspace/logs/*
+!workspace/logs/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

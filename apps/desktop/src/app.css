@@ -1,0 +1,129 @@
+/* Eson tokens — DM Sans body, Outfit display, stone accent (#aaa69d).
+   Light = white + off-white sidenav; dark = dark shell. */
+
+/* ---- Local fonts (variable + italic). Folder name has a comma; we URL
+        encode it as %2C so Vite/WebKit don't misparse the @font-face URL. */
+@font-face {
+  font-family: "DM Sans";
+  src: url("/fonts/DM_Sans%2COutfit/DM_Sans/DMSans-VariableFont_opsz,wght.ttf")
+    format("truetype-variations");
+  font-weight: 100 1000;
+  font-stretch: 75% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "DM Sans";
+  src: url("/fonts/DM_Sans%2COutfit/DM_Sans/DMSans-Italic-VariableFont_opsz,wght.ttf")
+    format("truetype-variations");
+  font-weight: 100 1000;
+  font-stretch: 75% 125%;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Outfit";
+  src: url("/fonts/DM_Sans%2COutfit/Outfit/Outfit-VariableFont_wght.ttf")
+    format("truetype-variations");
+  font-weight: 100 1000;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --wash-sidebar-w: 264px;
+  --wash-sidebar-w-collapsed: 60px;
+  --wash-radius: 12px;
+  --wash-radius-sm: 8px;
+  --wash-font: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Helvetica Neue", Arial, sans-serif;
+  --wash-display: "Outfit", "DM Sans", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --wash-mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  --wash-chat-max: 52rem;
+  /* Text on solid brand buttons (muted stone background) */
+  --wash-on-brand: #1e1d1b;
+  /* Inline notices that tint toward the accent */
+  --wash-accent: #aaa69d;
+}
+
+:root,
+:root[data-theme="dark"] {
+  --wash-bg: #131313;
+  --wash-chat-bg: #212121;
+  --wash-panel: #1a1a1a;
+  --wash-border: rgba(68, 68, 68, 0.66);
+  --wash-text: #ffffff;
+  --wash-muted: rgba(212, 212, 212, 0.9);
+  --wash-brand: #aaa69d;
+  --wash-brand-dim: rgba(170, 166, 157, 0.22);
+  --wash-user-bg: #2a2a2a;
+  --wash-user-border: #3d3d3d;
+  --wash-code-bg: #1e1e1e;
+  --wash-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  --wash-warn-text: #f0a8a8;
+  --wash-row-hover: rgba(255, 255, 255, 0.04);
+  --wash-code-inline: rgba(255, 255, 255, 0.06);
+  --wash-table-stripe: rgba(255, 255, 255, 0.02);
+  --wash-act-divider: rgba(255, 255, 255, 0.04);
+}
+
+:root[data-theme="light"] {
+  --wash-bg: #ffffff;
+  --wash-chat-bg: #ffffff;
+  --wash-panel: #f7f7f8;
+  --wash-border: rgba(0, 0, 0, 0.08);
+  --wash-text: #111111;
+  --wash-muted: rgba(60, 60, 60, 0.78);
+  --wash-brand: #aaa69d;
+  --wash-brand-dim: rgba(170, 166, 157, 0.22);
+  --wash-user-bg: #f1f1f3;
+  --wash-user-border: rgba(0, 0, 0, 0.08);
+  --wash-code-bg: #f3f3f4;
+  --wash-shadow: 0 12px 36px rgba(0, 0, 0, 0.06);
+  --wash-warn-text: #b91c1c;
+  --wash-row-hover: rgba(0, 0, 0, 0.05);
+  --wash-code-inline: rgba(0, 0, 0, 0.05);
+  --wash-table-stripe: rgba(0, 0, 0, 0.025);
+  --wash-act-divider: rgba(0, 0, 0, 0.05);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: var(--wash-font);
+  background: var(--wash-bg);
+  color: var(--wash-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: var(--wash-brand-dim);
+  color: var(--wash-text);
+}
