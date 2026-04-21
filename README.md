@@ -86,6 +86,33 @@ It can also analyze structured files in your workspace (including CSV and Excel)
    curl -X POST http://127.0.0.1:8787/ingestion/scan-images
    ```
 
+## Images + semantic search
+
+Eson indexes the images in your workspace so the agent can answer questions like
+"find the screenshots with the invoice total" or "the diagram I saved last week."
+
+Pipeline (per image, on `/ingestion/scan-images`):
+
+1. The vision model (`gemma4:e4b` on Ollama by default) produces a short caption
+   and extracts any readable text.
+2. `caption + OCR` is embedded with `qwen3-embedding:4b` via Ollama's
+   OpenAI-compatible `/v1/embeddings` endpoint.
+3. The resulting 2560-dimensional vector is stored in the memory sidecar's
+   `image_embeddings` table (one row per image, `chunk_id="full"`).
+
+At chat time, the new `search_images` LLM tool embeds your natural-language
+query and returns the top-K matches with workspace-relative paths, captions,
+OCR snippets, and cosine similarity scores.
+
+One-time setup:
+
+```bash
+ollama pull qwen3-embedding:4b
+```
+
+Tunables (see `.env.example`): `ESON_EMBED_MODEL`, `ESON_EMBED_BASE_URL`,
+`ESON_IMAGE_MAX_BYTES`, `ESON_IMAGE_ANALYZE_TIMEOUT_SEC`.
+
 ## Environment highlights
 
 See [.env.example](.env.example) for the full list. Common settings:

@@ -58,6 +58,8 @@ async fn main() {
         .route("/delete", post(delete_memory))
         .route("/clear", post(clear_all))
         .route("/images/register", post(register_image))
+        .route("/images/embed", post(put_image_embedding))
+        .route("/images/search", post(search_image_embeddings))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -421,6 +423,12 @@ struct RegisterImageBody {
     file_ext: String,
     #[serde(default)]
     ocr_text: Option<String>,
+    /// Human-readable caption produced by the vision LLM. Stored in
+    /// `images.caption` so downstream readers (search UI, future
+    /// recall tools) can render a one-line description alongside the
+    /// OCR text without re-running the LLM.
+    #[serde(default)]
+    caption: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -449,7 +457,7 @@ async fn register_image(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
         r#"INSERT INTO images (id, source_path, file_hash, file_ext, mime_type, ocr_text, caption, confidence, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 1.0, ?7)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8)"#,
         rusqlite::params![
             id,
             body.source_path,
@@ -457,6 +465,7 @@ async fn register_image(
             body.file_ext,
             mime,
             body.ocr_text,
+            body.caption,
             now
         ],
     )
@@ -467,6 +476,227 @@ async fn register_image(
     Ok(Json(RegisterImageResp { id }))
 }
 
+/// Body for `POST /images/embed`. We upsert by
+/// `(image_id, chunk_id, model_name)` so re-running the indexer with
+/// the same model on an unchanged image is idempotent.
+#[derive(Deserialize)]
+struct PutImageEmbeddingBody {
+    image_id: String,
+    #[serde(default = "default_chunk_id")]
+    chunk_id: String,
+    model_name: String,
+    dim: usize,
+    /// f32 components. We pack them little-endian into `BLOB` so the
+    /// read side can decode regardless of host endianness (SQLite
+    /// databases are routinely copied between machines).
+    vector: Vec<f32>,
+}
+
+fn default_chunk_id() -> String {
+    "full".to_string()
+}
+
+async fn put_image_embedding(
+    State(state): State<AppState>,
+    Json(body): Json<PutImageEmbeddingBody>,
+) -> Result<StatusCode, StatusCode> {
+    if body.vector.is_empty() || body.vector.len() != body.dim {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if body.model_name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let blob = encode_vector(&body.vector);
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Ensure the referenced image exists; otherwise the client is racing
+    // or sending stale ids. Fail loudly with 404 so the caller logs it.
+    let exists: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM images WHERE id = ?1",
+            [&body.image_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if exists.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Idempotent upsert: drop any prior embedding for this
+    // (image, chunk, model) triplet before inserting the new one.
+    db.execute(
+        "DELETE FROM image_embeddings \
+         WHERE image_id = ?1 AND chunk_id = ?2 AND model_name = ?3",
+        rusqlite::params![body.image_id, body.chunk_id, body.model_name],
+    )
+    .map_err(|e| {
+        warn!("put_image_embedding delete: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    db.execute(
+        r#"INSERT INTO image_embeddings
+               (id, image_id, chunk_id, model_name, dim, vector, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        rusqlite::params![
+            id,
+            body.image_id,
+            body.chunk_id,
+            body.model_name,
+            body.dim as i64,
+            blob,
+            now
+        ],
+    )
+    .map_err(|e| {
+        warn!("put_image_embedding insert: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SearchImageEmbeddingsBody {
+    vector: Vec<f32>,
+    model_name: String,
+    dim: usize,
+    /// Clamped to `[1, 20]` server-side so a chatty client can't force
+    /// the sidecar to return huge payloads.
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+}
+
+fn default_top_k() -> usize {
+    5
+}
+
+#[derive(Serialize)]
+struct ImageSearchHit {
+    image_id: String,
+    source_path: String,
+    caption: Option<String>,
+    ocr_snippet: Option<String>,
+    score: f32,
+}
+
+async fn search_image_embeddings(
+    State(state): State<AppState>,
+    Json(body): Json<SearchImageEmbeddingsBody>,
+) -> Result<Json<Vec<ImageSearchHit>>, StatusCode> {
+    if body.vector.is_empty() || body.vector.len() != body.dim {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if body.model_name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let top_k = body.top_k.clamp(1, 20);
+    let query_norm = l2_norm(&body.vector);
+    if query_norm == 0.0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stmt = db
+        .prepare(
+            r#"SELECT e.vector, i.id, i.source_path, i.caption, i.ocr_text
+               FROM image_embeddings e
+               JOIN images i ON i.id = e.image_id
+               WHERE e.model_name = ?1 AND e.dim = ?2"#,
+        )
+        .map_err(|e| {
+            warn!("search_image_embeddings prepare: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let iter = stmt
+        .query_map(
+            rusqlite::params![body.model_name, body.dim as i64],
+            |r| {
+                let vector: Vec<u8> = r.get(0)?;
+                let image_id: String = r.get(1)?;
+                let source_path: String = r.get(2)?;
+                let caption: Option<String> = r.get(3)?;
+                let ocr_text: Option<String> = r.get(4)?;
+                Ok((vector, image_id, source_path, caption, ocr_text))
+            },
+        )
+        .map_err(|e| {
+            warn!("search_image_embeddings query: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut scored: Vec<(f32, ImageSearchHit)> = Vec::new();
+    for row in iter.flatten() {
+        let (vector_bytes, image_id, source_path, caption, ocr_text) = row;
+        let Some(doc) = decode_vector(&vector_bytes, body.dim) else {
+            continue;
+        };
+        let score = cosine_with_query_norm(&body.vector, query_norm, &doc);
+        if !score.is_finite() {
+            continue;
+        }
+        let hit = ImageSearchHit {
+            image_id,
+            source_path,
+            caption,
+            ocr_snippet: ocr_text.map(|t| snippet_text(&t, 240)),
+            score,
+        };
+        scored.push((score, hit));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let hits: Vec<ImageSearchHit> = scored.into_iter().take(top_k).map(|(_, h)| h).collect();
+    Ok(Json(hits))
+}
+
+fn encode_vector(vec: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vec.len() * 4);
+    for v in vec {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vector(bytes: &[u8], expected_dim: usize) -> Option<Vec<f32>> {
+    if bytes.len() != expected_dim * 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(expected_dim);
+    for chunk in bytes.chunks_exact(4) {
+        let arr: [u8; 4] = chunk.try_into().ok()?;
+        out.push(f32::from_le_bytes(arr));
+    }
+    Some(out)
+}
+
+fn l2_norm(v: &[f32]) -> f32 {
+    let sum: f32 = v.iter().map(|x| x * x).sum();
+    sum.sqrt()
+}
+
+fn cosine_with_query_norm(q: &[f32], q_norm: f32, d: &[f32]) -> f32 {
+    if q.len() != d.len() {
+        return f32::NAN;
+    }
+    let mut dot = 0.0f32;
+    let mut d_sq = 0.0f32;
+    for i in 0..q.len() {
+        dot += q[i] * d[i];
+        d_sq += d[i] * d[i];
+    }
+    let d_norm = d_sq.sqrt();
+    if d_norm == 0.0 || q_norm == 0.0 {
+        return 0.0;
+    }
+    dot / (q_norm * d_norm)
+}
+
+fn snippet_text(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max_chars).collect();
+        format!("{head}…")
+    }
+}
+
 async fn clear_all(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute_batch(
@@ -474,4 +704,49 @@ async fn clear_all(State(state): State<AppState>) -> Result<StatusCode, StatusCo
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_round_trip_is_lossless() {
+        let v: Vec<f32> = vec![-1.5, 0.0, 0.25, 3.125, 42.0];
+        let bytes = encode_vector(&v);
+        assert_eq!(bytes.len(), v.len() * 4);
+        let decoded = decode_vector(&bytes, v.len()).unwrap();
+        assert_eq!(decoded, v);
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length() {
+        let bytes = encode_vector(&[1.0, 2.0, 3.0]);
+        assert!(decode_vector(&bytes, 4).is_none());
+        assert!(decode_vector(&bytes[..bytes.len() - 1], 3).is_none());
+    }
+
+    #[test]
+    fn cosine_of_identical_vectors_is_one() {
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        let n = l2_norm(&v);
+        let s = cosine_with_query_norm(&v, n, &v);
+        assert!((s - 1.0).abs() < 1e-6, "got {s}");
+    }
+
+    #[test]
+    fn cosine_of_orthogonal_vectors_is_zero() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let s = cosine_with_query_norm(&a, l2_norm(&a), &b);
+        assert!(s.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_handles_zero_vector_gracefully() {
+        let q = vec![1.0, 0.0];
+        let z = vec![0.0, 0.0];
+        let s = cosine_with_query_norm(&q, l2_norm(&q), &z);
+        assert_eq!(s, 0.0);
+    }
 }

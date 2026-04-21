@@ -656,6 +656,15 @@
     ollamaModel: string;
     visionProvider: VisionProvider;
     visionModel: string;
+    /** Text-embeddings routing used by scan_images indexing and the
+     * search_images LLM tool. Resolved from ESON_EMBED_* env vars at
+     * agent startup — the UI shows the live value so the user can
+     * confirm what's in use without opening a terminal. Changing
+     * requires an env-var edit + restart (by design, because existing
+     * `image_embeddings` rows are tied to the model's dimensionality). */
+    embeddingsProvider: string;
+    embeddingsModel: string;
+    embeddingsBaseUrl: string;
   };
   let providerDefaults: ProviderDefaults = {
     anthropicModel: "",
@@ -668,6 +677,9 @@
     ollamaModel: "",
     visionProvider: "ollama",
     visionModel: "",
+    embeddingsProvider: "ollama",
+    embeddingsModel: "qwen3-embedding:4b",
+    embeddingsBaseUrl: "http://127.0.0.1:11434",
   };
   type OllamaInstallPhase =
     | "idle"
@@ -879,6 +891,7 @@
         };
         ollama?: { url?: string; model?: string };
         vision?: { provider?: string; model?: string };
+        embeddings?: { provider?: string; model?: string; base_url?: string };
       };
       const visionDefault: VisionProvider = isVisionProvider(d.vision?.provider)
         ? (d.vision!.provider as VisionProvider)
@@ -894,6 +907,9 @@
         ollamaModel: str(d.ollama?.model),
         visionProvider: visionDefault,
         visionModel: str(d.vision?.model),
+        embeddingsProvider: str(d.embeddings?.provider) || "ollama",
+        embeddingsModel: str(d.embeddings?.model) || "qwen3-embedding:4b",
+        embeddingsBaseUrl: str(d.embeddings?.base_url) || "http://127.0.0.1:11434",
       };
       // Only seed empty fields — never overwrite a value the user explicitly
       // typed. The "Reset to defaults" button gives them a way to discard.
@@ -3493,6 +3509,20 @@
             <button
               type="button"
               class="theme-btn"
+              class:selected={editingProvider === "ollama"}
+              class:provider-primary={aiProvider === "ollama"}
+              class:provider-unconfigured={!providerAvailability.ollama}
+              title={providerAvailability.ollama ? "" : "No URL yet — pick this and add one below"}
+              on:click={() => (editingProvider = "ollama")}
+            >
+              Ollama
+              {#if aiProvider === "ollama"}
+                <span class="primary-pill" aria-label="primary">★ primary</span>
+              {/if}
+            </button>
+            <button
+              type="button"
+              class="theme-btn"
               class:selected={editingProvider === "anthropic"}
               class:provider-primary={aiProvider === "anthropic"}
               class:provider-unconfigured={!providerAvailability.anthropic}
@@ -3518,20 +3548,6 @@
                 <span class="primary-pill" aria-label="primary">★ primary</span>
               {/if}
             </button>
-            <button
-              type="button"
-              class="theme-btn"
-              class:selected={editingProvider === "ollama"}
-              class:provider-primary={aiProvider === "ollama"}
-              class:provider-unconfigured={!providerAvailability.ollama}
-              title={providerAvailability.ollama ? "" : "No URL yet — pick this and add one below"}
-              on:click={() => (editingProvider = "ollama")}
-            >
-              Ollama
-              {#if aiProvider === "ollama"}
-                <span class="primary-pill" aria-label="primary">★ primary</span>
-              {/if}
-            </button>
           </div>
           {#if !providerAvailability[editingProvider]}
             <div class="provider-hint" role="note">
@@ -3550,95 +3566,7 @@
               {/if}
             </div>
           {/if}
-          {#if editingProvider === "anthropic"}
-            <div class="provider-fields">
-              <label class="field-label" for="anthropic-model">Model</label>
-              <input
-                id="anthropic-model"
-                class="field-input"
-                bind:value={anthropicModel}
-                placeholder={providerDefaults.anthropicModel || "claude-haiku-4-5-20251001"}
-              />
-              {#if providerDefaults.anthropicModel && providerDefaults.anthropicModel !== anthropicModel}
-                <div class="field-default">
-                  Default from <code>secrets.env</code>: <code>{providerDefaults.anthropicModel}</code>
-                  <button type="button" class="field-default-link" on:click={() => (anthropicModel = providerDefaults.anthropicModel)}>Use</button>
-                </div>
-              {/if}
-              <label class="field-label" for="anthropic-key">API key</label>
-              <input
-                id="anthropic-key"
-                class="field-input"
-                type="password"
-                bind:value={anthropicApiKey}
-                placeholder={providerDefaults.anthropicConfigured ? "•••••• (from secrets.env)" : "sk-ant-..."}
-              />
-              <div class="field-default">
-                {#if providerDefaults.anthropicApiKey && providerDefaults.anthropicApiKey !== anthropicApiKey}
-                  Default from <code>secrets.env</code>: <code>{maskKey(providerDefaults.anthropicApiKey)}</code>
-                  <button type="button" class="field-default-link" on:click={() => (anthropicApiKey = providerDefaults.anthropicApiKey)}>Use</button>
-                {:else if providerDefaults.anthropicConfigured && !anthropicApiKey}
-                  Using key from <code>secrets.env</code>.
-                {/if}
-              </div>
-              <label class="primary-toggle" for="anthropic-primary">
-                <input
-                  id="anthropic-primary"
-                  type="checkbox"
-                  checked={aiProvider === "anthropic"}
-                  on:change={(e) => togglePrimary("anthropic", e.currentTarget)}
-                />
-                <span>
-                  <strong>Set as primary</strong> — chat uses Anthropic first,
-                  then falls back through the other configured providers.
-                </span>
-              </label>
-            </div>
-          {:else if editingProvider === "openai"}
-            <div class="provider-fields">
-              <label class="field-label" for="openai-model">Model</label>
-              <input
-                id="openai-model"
-                class="field-input"
-                bind:value={openaiModel}
-                placeholder={providerDefaults.openaiModel || "gpt-4o-mini"}
-              />
-              {#if providerDefaults.openaiModel && providerDefaults.openaiModel !== openaiModel}
-                <div class="field-default">
-                  Default from <code>secrets.env</code>: <code>{providerDefaults.openaiModel}</code>
-                  <button type="button" class="field-default-link" on:click={() => (openaiModel = providerDefaults.openaiModel)}>Use</button>
-                </div>
-              {/if}
-              <label class="field-label" for="openai-key">API key</label>
-              <input
-                id="openai-key"
-                class="field-input"
-                type="password"
-                bind:value={openaiApiKey}
-                placeholder={providerDefaults.openaiConfigured ? "•••••• (from secrets.env)" : "sk-..."}
-              />
-              <div class="field-default">
-                {#if providerDefaults.openaiApiKey && providerDefaults.openaiApiKey !== openaiApiKey}
-                  Default from <code>secrets.env</code>: <code>{maskKey(providerDefaults.openaiApiKey)}</code>
-                  <button type="button" class="field-default-link" on:click={() => (openaiApiKey = providerDefaults.openaiApiKey)}>Use</button>
-                {:else if providerDefaults.openaiConfigured && !openaiApiKey}
-                  Using key from <code>secrets.env</code>.
-                {/if}
-              </div>
-              <label class="primary-toggle" for="openai-primary">
-                <input
-                  id="openai-primary"
-                  type="checkbox"
-                  checked={aiProvider === "openai"}
-                  on:change={(e) => togglePrimary("openai", e.currentTarget)}
-                />
-                <span>
-                  <strong>Set as primary</strong> — chat uses OpenAI first,
-                  then falls back through the other configured providers.
-                </span>
-              </label>
-            </div>
-          {:else}
+          {#if editingProvider === "ollama"}
             <div class="provider-fields">
               <label class="field-label" for="ollama-url">URL</label>
               <input
@@ -3720,6 +3648,94 @@
                 />
                 <span>
                   <strong>Set as primary</strong> — chat uses Ollama first,
+                  then falls back through the other configured providers.
+                </span>
+              </label>
+            </div>
+          {:else if editingProvider === "anthropic"}
+            <div class="provider-fields">
+              <label class="field-label" for="anthropic-model">Model</label>
+              <input
+                id="anthropic-model"
+                class="field-input"
+                bind:value={anthropicModel}
+                placeholder={providerDefaults.anthropicModel || "claude-haiku-4-5-20251001"}
+              />
+              {#if providerDefaults.anthropicModel && providerDefaults.anthropicModel !== anthropicModel}
+                <div class="field-default">
+                  Default from <code>secrets.env</code>: <code>{providerDefaults.anthropicModel}</code>
+                  <button type="button" class="field-default-link" on:click={() => (anthropicModel = providerDefaults.anthropicModel)}>Use</button>
+                </div>
+              {/if}
+              <label class="field-label" for="anthropic-key">API key</label>
+              <input
+                id="anthropic-key"
+                class="field-input"
+                type="password"
+                bind:value={anthropicApiKey}
+                placeholder={providerDefaults.anthropicConfigured ? "•••••• (from secrets.env)" : "sk-ant-..."}
+              />
+              <div class="field-default">
+                {#if providerDefaults.anthropicApiKey && providerDefaults.anthropicApiKey !== anthropicApiKey}
+                  Default from <code>secrets.env</code>: <code>{maskKey(providerDefaults.anthropicApiKey)}</code>
+                  <button type="button" class="field-default-link" on:click={() => (anthropicApiKey = providerDefaults.anthropicApiKey)}>Use</button>
+                {:else if providerDefaults.anthropicConfigured && !anthropicApiKey}
+                  Using key from <code>secrets.env</code>.
+                {/if}
+              </div>
+              <label class="primary-toggle" for="anthropic-primary">
+                <input
+                  id="anthropic-primary"
+                  type="checkbox"
+                  checked={aiProvider === "anthropic"}
+                  on:change={(e) => togglePrimary("anthropic", e.currentTarget)}
+                />
+                <span>
+                  <strong>Set as primary</strong> — chat uses Anthropic first,
+                  then falls back through the other configured providers.
+                </span>
+              </label>
+            </div>
+          {:else}
+            <div class="provider-fields">
+              <label class="field-label" for="openai-model">Model</label>
+              <input
+                id="openai-model"
+                class="field-input"
+                bind:value={openaiModel}
+                placeholder={providerDefaults.openaiModel || "gpt-4o-mini"}
+              />
+              {#if providerDefaults.openaiModel && providerDefaults.openaiModel !== openaiModel}
+                <div class="field-default">
+                  Default from <code>secrets.env</code>: <code>{providerDefaults.openaiModel}</code>
+                  <button type="button" class="field-default-link" on:click={() => (openaiModel = providerDefaults.openaiModel)}>Use</button>
+                </div>
+              {/if}
+              <label class="field-label" for="openai-key">API key</label>
+              <input
+                id="openai-key"
+                class="field-input"
+                type="password"
+                bind:value={openaiApiKey}
+                placeholder={providerDefaults.openaiConfigured ? "•••••• (from secrets.env)" : "sk-..."}
+              />
+              <div class="field-default">
+                {#if providerDefaults.openaiApiKey && providerDefaults.openaiApiKey !== openaiApiKey}
+                  Default from <code>secrets.env</code>: <code>{maskKey(providerDefaults.openaiApiKey)}</code>
+                  <button type="button" class="field-default-link" on:click={() => (openaiApiKey = providerDefaults.openaiApiKey)}>Use</button>
+                {:else if providerDefaults.openaiConfigured && !openaiApiKey}
+                  Using key from <code>secrets.env</code>.
+                {/if}
+              </div>
+              <label class="primary-toggle" for="openai-primary">
+                <input
+                  id="openai-primary"
+                  type="checkbox"
+                  checked={aiProvider === "openai"}
+                  on:change={(e) => togglePrimary("openai", e.currentTarget)}
+                />
+                <span>
+                  <strong>Set as primary</strong> — chat uses OpenAI first,
                   then falls back through the other configured providers.
                 </span>
               </label>
@@ -3854,6 +3870,54 @@
               Reset to defaults
             </button>
             <span class="provider-save-hint">Also saved as you type.</span>
+          </div>
+        </div>
+        <div class="panel-section">
+          <h2 class="panel-h">Embeddings</h2>
+          <p class="panel-p">
+            Text embeddings for image semantic search — powers the
+            <code>search_images</code> tool and the vector stored per image
+            by <code>POST /ingestion/scan-images</code>. Read-only: the
+            dimensionality is tied to existing
+            <code>image_embeddings</code> rows, so changing the model
+            means a re-scan. Override via <code>ESON_EMBED_MODEL</code> /
+            <code>ESON_EMBED_BASE_URL</code> in your env and restart the
+            agent.
+          </p>
+          <div class="provider-fields">
+            <label class="field-label" for="embeddings-provider">Provider</label>
+            <input
+              id="embeddings-provider"
+              class="field-input"
+              value={providerDefaults.embeddingsProvider}
+              readonly
+            />
+          </div>
+          <div class="provider-fields">
+            <label class="field-label" for="embeddings-model">Model</label>
+            <input
+              id="embeddings-model"
+              class="field-input"
+              value={providerDefaults.embeddingsModel}
+              readonly
+            />
+            <div class="field-default">
+              Default: <code>qwen3-embedding:4b</code> (2560-dim). First use
+              requires <code>ollama pull qwen3-embedding:4b</code>.
+            </div>
+          </div>
+          <div class="provider-fields">
+            <label class="field-label" for="embeddings-base-url">Base URL</label>
+            <input
+              id="embeddings-base-url"
+              class="field-input"
+              value={providerDefaults.embeddingsBaseUrl}
+              readonly
+            />
+            <div class="field-default">
+              Posts to <code>{providerDefaults.embeddingsBaseUrl}/v1/embeddings</code>
+              (OpenAI-compatible shape; served natively by Ollama).
+            </div>
           </div>
         </div>
         <div class="panel-section">
@@ -5588,36 +5652,48 @@
     line-height: 1.4;
   }
 
+  /* Segmented-control styled as a soft pill track: the track is a low-contrast
+     rounded rectangle, and the selected tab "pops out" as an elevated pill
+     that sits on top of it. No outer border, no internal dividers — the
+     elevation alone marks the selection. Used for AI provider, vision,
+     background-tasks and theme toggles. */
   .theme-toggle {
     display: inline-flex;
-    border: 1px solid var(--wash-border);
-    border-radius: var(--wash-radius-sm);
-    overflow: hidden;
+    align-items: center;
+    gap: 0.15rem;
+    padding: 0.2rem;
+    border: none;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--wash-border) 35%, transparent);
+    overflow: visible;
   }
 
   .theme-btn {
-    padding: 0.5rem 1.25rem;
-    font-size: 0.85rem;
+    padding: 0.38rem 0.95rem;
+    font-size: 0.83rem;
     font-weight: 600;
     color: var(--wash-muted);
     background: transparent;
+    border: 1px solid transparent;
+    border-radius: 999px;
     transition:
-      background 0.12s ease,
-      color 0.12s ease;
+      background 0.15s ease,
+      color 0.15s ease,
+      box-shadow 0.15s ease,
+      transform 0.15s ease;
   }
 
-  .theme-btn:hover {
-    background: var(--wash-row-hover);
+  .theme-btn:hover:not(.selected) {
+    background: color-mix(in srgb, var(--wash-row-hover) 70%, transparent);
     color: var(--wash-text);
   }
 
   .theme-btn.selected {
-    background: var(--wash-brand-dim);
+    background: var(--wash-panel);
     color: var(--wash-brand);
-  }
-
-  .theme-btn + .theme-btn {
-    border-left: 1px solid var(--wash-border);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.08),
+      0 0 0 1px color-mix(in srgb, var(--wash-border) 55%, transparent);
   }
 
   .theme-btn:disabled {
@@ -5634,14 +5710,19 @@
 
   /* Provider button shown when the provider has no key/URL configured yet.
      We deliberately keep it clickable (so the user can open the form to
-     paste a key) but visually muted so it's clear it's "unconfigured". */
+     paste a key) but visually muted so it's clear it's "unconfigured". The
+     leading ○ marker keeps the signal without needing a dashed border. */
   .theme-btn.provider-unconfigured {
-    opacity: 0.65;
-    border-style: dashed;
+    opacity: 0.6;
+  }
+  .theme-btn.provider-unconfigured::before {
+    content: "○";
+    margin-right: 0.35rem;
+    font-weight: 400;
+    opacity: 0.8;
   }
   .theme-btn.provider-unconfigured.selected {
     opacity: 1;
-    border-style: solid;
   }
 
   .provider-hint {
@@ -5689,10 +5770,11 @@
     white-space: nowrap;
     vertical-align: middle;
   }
-  /* Slightly stronger tab border when it is the primary (visible even when
-     the tab is not the currently edited one). */
+  /* Primary provider is already called out by the inline "★ primary" pill
+     inside the button, so no extra border tint here — keep the tab visually
+     quiet and let the pill do the talking. */
   .theme-btn.provider-primary {
-    border-color: var(--wash-link, #2563eb);
+    border-color: transparent;
   }
 
   /* "Set as primary" checkbox row shown at the bottom of each provider's

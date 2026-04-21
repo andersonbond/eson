@@ -1,7 +1,7 @@
 //! HTTP client for eson-memory sidecar (graceful degradation if down).
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct MemoryClient {
@@ -52,19 +52,25 @@ impl MemoryClient {
         Ok(v.answer)
     }
 
+    /// Registers (or re-registers) an image row and returns the
+    /// server-generated `image_id`. `ocr_text` and `caption` are both
+    /// optional — callers that only have one can pass `None` for the
+    /// other and the sidecar will store NULL.
     pub async fn register_image(
         &self,
         source_path: &str,
         file_hash: &str,
         file_ext: &str,
         ocr_text: Option<&str>,
-    ) -> Result<(), String> {
+        caption: Option<&str>,
+    ) -> Result<String, String> {
         let url = format!("{}/images/register", self.base);
         let body = serde_json::json!({
             "source_path": source_path,
             "file_hash": file_hash,
             "file_ext": file_ext,
             "ocr_text": ocr_text,
+            "caption": caption,
         });
         let res = self
             .http
@@ -76,7 +82,67 @@ impl MemoryClient {
         if !res.status().is_success() {
             return Err(format!("register_image {}", res.status()));
         }
+        let v: RegisterImageResponse = res.json().await.map_err(|e| e.to_string())?;
+        Ok(v.id)
+    }
+
+    /// Stores an embedding vector for an image. `chunk_id` lets us
+    /// extend to per-region embeddings later without changing callers.
+    pub async fn put_image_embedding(
+        &self,
+        image_id: &str,
+        chunk_id: &str,
+        model_name: &str,
+        vector: &[f32],
+    ) -> Result<(), String> {
+        let url = format!("{}/images/embed", self.base);
+        let body = serde_json::json!({
+            "image_id": image_id,
+            "chunk_id": chunk_id,
+            "model_name": model_name,
+            "dim": vector.len(),
+            "vector": vector,
+        });
+        let res = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("put_image_embedding {}", res.status()));
+        }
         Ok(())
+    }
+
+    /// Runs a cosine top-K search against the sidecar and returns the
+    /// matching image rows (already sorted by descending score).
+    pub async fn search_images(
+        &self,
+        model_name: &str,
+        query_vector: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<ImageHit>, String> {
+        let url = format!("{}/images/search", self.base);
+        let body = serde_json::json!({
+            "model_name": model_name,
+            "dim": query_vector.len(),
+            "vector": query_vector,
+            "top_k": top_k,
+        });
+        let res = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("search_images {}", res.status()));
+        }
+        let hits: Vec<ImageHit> = res.json().await.map_err(|e| e.to_string())?;
+        Ok(hits)
     }
 }
 
@@ -88,4 +154,18 @@ struct IngestResponse {
 #[derive(Deserialize)]
 struct QueryResponse {
     answer: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterImageResponse {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageHit {
+    pub image_id: String,
+    pub source_path: String,
+    pub caption: Option<String>,
+    pub ocr_snippet: Option<String>,
+    pub score: f32,
 }

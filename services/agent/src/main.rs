@@ -15,6 +15,7 @@ use eson_agent::{
         build_digest_bundle, build_llm_message, should_record_event_kind, ChatSnippet,
         RecentEvent, RecentEventsBuffer, CONSOLIDATION_SKILL_ID, DEFAULT_WINDOW_SECS,
     },
+    embedder,
     llm::{
         anthropic_client_or_none, max_llm_tool_rounds, ollama_client_or_none, openai_client_or_none,
         provider_ui_defaults, AnthropicClient, AnthropicConfig, ApiMessage, OpenAiCompatClient,
@@ -64,6 +65,11 @@ struct AppState {
     /// [`consolidation::should_record_event_kind`] for the kinds
     /// that are retained.
     recent_events: Arc<Mutex<RecentEventsBuffer>>,
+    /// Text embedder used by `scan_images` (doc side) and the
+    /// `search_images` tool (query side). Defaults to Ollama
+    /// `qwen3-embedding:4b` via the OpenAI-compatible
+    /// `/v1/embeddings` endpoint — see [`embedder::EmbedClient`].
+    embedder: Arc<embedder::EmbedClient>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -755,6 +761,13 @@ async fn main() {
         info!(sid = %s.id, "socket connected");
     });
 
+    let embedder = Arc::new(embedder::EmbedClient::from_env());
+    info!(
+        model = embedder.model(),
+        base = embedder.base(),
+        "text embedder (search_images query + scan_images indexing)"
+    );
+
     let state = AppState {
         workspace: workspace.clone(),
         agent_memory: agent_memory.clone(),
@@ -771,6 +784,7 @@ async fn main() {
         tool_socket_queue: tool_socket_queue.clone(),
         background_config: background_config.clone(),
         recent_events: Arc::new(Mutex::new(RecentEventsBuffer::default())),
+        embedder,
     };
 
     let bg_state = state.clone();
@@ -993,6 +1007,8 @@ fn dispatch_agent_tool(
     socket_queue: &Arc<Mutex<Vec<(String, Value)>>>,
     io: &SocketIo,
     vision: &vision::VisionConfig,
+    embedder: &embedder::EmbedClient,
+    memory_client: &MemoryClient,
     cancel: &Arc<AtomicBool>,
     session_id: &str,
     name: &str,
@@ -1016,6 +1032,8 @@ fn dispatch_agent_tool(
         skills_root,
         socket_queue,
         vision,
+        embedder,
+        memory_client,
     };
     // Announce the tool *before* the (potentially multi-minute) call so
     // the user sees an in-flight step in the reasoning panel + Activity
@@ -1339,6 +1357,8 @@ async fn try_provider(
             let sq = state.tool_socket_queue.clone();
             let sid = session_id.to_string();
             let vc = vision_cfg.clone();
+            let ec = state.embedder.clone();
+            let mc = state.memory.clone();
             let cancel_tool = cancel.clone();
             let think_io = state.io.clone();
             let think_sid = session_id.to_string();
@@ -1366,6 +1386,8 @@ async fn try_provider(
                             &sq,
                             &io,
                             &vc,
+                            ec.as_ref(),
+                            &mc,
                             &cancel_tool,
                             &sid,
                             name,
@@ -1426,6 +1448,8 @@ async fn try_provider(
             let sq = state.tool_socket_queue.clone();
             let sid = session_id.to_string();
             let vc = vision_cfg.clone();
+            let ec = state.embedder.clone();
+            let mc = state.memory.clone();
             let cancel_tool = cancel.clone();
             let think_io = state.io.clone();
             let think_sid = session_id.to_string();
@@ -1453,6 +1477,8 @@ async fn try_provider(
                             &sq,
                             &io,
                             &vc,
+                            ec.as_ref(),
+                            &mc,
                             &cancel_tool,
                             &sid,
                             name,
@@ -1521,6 +1547,8 @@ async fn try_provider(
             let sq = state.tool_socket_queue.clone();
             let sid = session_id.to_string();
             let vc = vision_cfg.clone();
+            let ec = state.embedder.clone();
+            let mc = state.memory.clone();
             let cancel_tool = cancel.clone();
             let think_io = state.io.clone();
             let think_sid = session_id.to_string();
@@ -1548,6 +1576,8 @@ async fn try_provider(
                             &sq,
                             &io,
                             &vc,
+                            ec.as_ref(),
+                            &mc,
                             &cancel_tool,
                             &sid,
                             name,
@@ -3436,6 +3466,50 @@ fn cell_to_string(c: &calamine::Data) -> String {
     }
 }
 
+/// Prompt fed to the vision model. The explicit `OCR:` marker lets us
+/// cheaply split the reply into a human caption and verbatim OCR
+/// without a second LLM turn.
+const SCAN_IMAGE_PROMPT: &str = "Describe the image in ~2 sentences focusing on subject, context, and any notable objects. Then, on a new line, write OCR: followed by any readable text verbatim (or OCR: none if there is none).";
+
+/// Split a vision reply into `(caption, ocr_text)`. If the `OCR:`
+/// marker is missing we treat the whole reply as the caption — this
+/// keeps graceful behavior if a provider ignores the prompt format.
+fn split_vision_reply(reply: &str) -> (String, Option<String>) {
+    let trimmed = reply.trim();
+    // Match "OCR:" at the start of a line, case-insensitive.
+    let lower = trimmed.to_ascii_lowercase();
+    let marker = lower
+        .match_indices("ocr:")
+        .find(|(idx, _)| *idx == 0 || trimmed.as_bytes().get(idx - 1) == Some(&b'\n'));
+    match marker {
+        Some((idx, _)) => {
+            let caption = trimmed[..idx].trim().trim_end_matches(['\n', '\r']).to_string();
+            let ocr_raw = trimmed[idx + 4..].trim();
+            let ocr = if ocr_raw.is_empty() || ocr_raw.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(ocr_raw.to_string())
+            };
+            (caption, ocr)
+        }
+        None => (trimmed.to_string(), None),
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let _permit = state.policy.acquire_tool_permit().await;
     let _ = state
@@ -3460,8 +3534,22 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
     .await;
 
     let root = state.workspace.root();
-    let mut indexed = 0u32;
     let memory_up = state.memory.status_ok().await;
+
+    // Guardrails: caller can tune via env without a rebuild. Defaults:
+    // 25 MiB skip threshold, 60s per-image vision timeout.
+    let max_bytes = env_usize("ESON_IMAGE_MAX_BYTES", 25 * 1024 * 1024);
+    let analyze_timeout =
+        std::time::Duration::from_secs(env_u64("ESON_IMAGE_ANALYZE_TIMEOUT_SEC", 60));
+    let embed_model = state.embedder.model().to_string();
+    const EMBED_CHUNK_ID: &str = "full";
+
+    let mut indexed = 0u32;
+    let mut analyzed = 0u32;
+    let mut embedded = 0u32;
+    let mut skipped_large = 0u32;
+    let mut vision_errors = 0u32;
+    let mut embed_errors = 0u32;
 
     for abs in paths {
         let rel = abs.strip_prefix(root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3473,19 +3561,177 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
             .and_then(|e| e.to_str())
             .unwrap_or("bin")
             .to_ascii_lowercase();
+        let size_bytes = meta.len() as usize;
 
-        if memory_up {
+        // ---- 1. Size guardrail --------------------------------------------------
+        if size_bytes > max_bytes {
+            skipped_large += 1;
             let _ = state
-                .memory
-                .register_image(&rel_str, &hash, &ext, None)
+                .io
+                .emit(
+                    "image_file_processed",
+                    &json!({
+                        "path": rel_str,
+                        "status": "skipped_large",
+                        "bytes": size_bytes,
+                        "limit_bytes": max_bytes,
+                    }),
+                )
                 .await;
+            continue;
         }
+
+        // ---- 2. Vision analyze (caption + OCR) ----------------------------------
+        // Read file bytes once; reuse for both register + analyze path.
+        let bytes = match tokio::fs::read(&abs).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %rel_str, error = %e, "scan_images: read failed");
+                let _ = state
+                    .io
+                    .emit(
+                        "image_file_processed",
+                        &json!({ "path": rel_str, "status": "read_error" }),
+                    )
+                    .await;
+                continue;
+            }
+        };
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "heic" => "image/heic",
+            "webp" => "image/webp",
+            _ => "application/octet-stream",
+        }
+        .to_string();
+
+        // `vision::analyze_image` uses a blocking HTTP client, so wrap
+        // it in `spawn_blocking` + a tokio timeout. That way a slow
+        // vision model can't stall the whole tokio worker nor hang
+        // the scan indefinitely.
+        let prompt = SCAN_IMAGE_PROMPT.to_string();
+        let analyze = tokio::task::spawn_blocking(move || {
+            let cfg = vision::VisionConfig::from_env();
+            vision::analyze_image(&cfg, &bytes, &mime, &prompt)
+        });
+        let analyze_result = match tokio::time::timeout(analyze_timeout, analyze).await {
+            Ok(Ok(inner)) => inner,
+            Ok(Err(join_err)) => Err(format!("join: {join_err}")),
+            Err(_) => Err(format!(
+                "timeout after {}s",
+                analyze_timeout.as_secs()
+            )),
+        };
+
+        let (caption, ocr_text, vision_ok) = match analyze_result {
+            Ok(reply) => {
+                analyzed += 1;
+                let (cap, ocr) = split_vision_reply(&reply);
+                (cap, ocr, true)
+            }
+            Err(err) => {
+                vision_errors += 1;
+                tracing::warn!(path = %rel_str, error = %err, "scan_images: vision failed");
+                (String::new(), None, false)
+            }
+        };
+
+        // ---- 3. Register row ---------------------------------------------------
+        let image_id = if memory_up {
+            match state
+                .memory
+                .register_image(
+                    &rel_str,
+                    &hash,
+                    &ext,
+                    ocr_text.as_deref(),
+                    if caption.is_empty() { None } else { Some(&caption) },
+                )
+                .await
+            {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(path = %rel_str, error = %e, "scan_images: register failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         indexed += 1;
+
+        // ---- 4. Embed (caption + OCR) ------------------------------------------
+        let embed_input = format!(
+            "{}\n\n{}",
+            caption,
+            ocr_text.as_deref().unwrap_or("")
+        )
+        .trim()
+        .to_string();
+
+        let mut embed_dim: Option<usize> = None;
+        let mut embed_status = "skipped";
+        if let (true, Some(image_id)) = (!embed_input.is_empty(), image_id.as_ref()) {
+            match state.embedder.embed(&embed_input).await {
+                Ok(vec) => {
+                    let dim = vec.len();
+                    match state
+                        .memory
+                        .put_image_embedding(image_id, EMBED_CHUNK_ID, &embed_model, &vec)
+                        .await
+                    {
+                        Ok(()) => {
+                            embedded += 1;
+                            embed_dim = Some(dim);
+                            embed_status = "ok";
+                        }
+                        Err(e) => {
+                            embed_errors += 1;
+                            embed_status = "store_error";
+                            tracing::warn!(
+                                path = %rel_str, error = %e,
+                                "scan_images: put_image_embedding failed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    embed_errors += 1;
+                    embed_status = "embed_error";
+                    tracing::warn!(
+                        path = %rel_str, error = %e,
+                        "scan_images: embed failed"
+                    );
+                }
+            }
+        }
+
+        let caption_chars = caption.chars().count();
+        let ocr_chars = ocr_text.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+        let status = if !vision_ok {
+            "vision_error"
+        } else if !memory_up {
+            "memory_down"
+        } else {
+            "indexed"
+        };
+
         let _ = state
             .io
             .emit(
                 "image_file_processed",
-                &json!({ "path": rel_str, "memory": memory_up }),
+                &json!({
+                    "path": rel_str,
+                    "status": status,
+                    "caption_chars": caption_chars,
+                    "ocr_chars": ocr_chars,
+                    "embed_status": embed_status,
+                    "embed_dim": embed_dim,
+                    "embed_model": if embed_dim.is_some() { Some(embed_model.clone()) } else { None },
+                    "memory": memory_up,
+                }),
             )
             .await;
     }
@@ -3494,7 +3740,15 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
         .io
         .emit(
             "image_scan_completed",
-            &json!({ "indexed": indexed, "memory": memory_up }),
+            &json!({
+                "indexed": indexed,
+                "analyzed": analyzed,
+                "embedded": embedded,
+                "skipped_large": skipped_large,
+                "vision_errors": vision_errors,
+                "embed_errors": embed_errors,
+                "memory": memory_up,
+            }),
         )
         .await;
 
@@ -3503,10 +3757,64 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
         &json!({
             "kind": "image_scan_end",
             "indexed": indexed,
+            "analyzed": analyzed,
+            "embedded": embedded,
+            "skipped_large": skipped_large,
+            "vision_errors": vision_errors,
+            "embed_errors": embed_errors,
             "memory_reachable": memory_up,
+            "embed_model": embed_model,
         }),
     )
     .await;
 
-    Ok(Json(json!({ "indexed": indexed, "memory_reachable": memory_up })))
+    Ok(Json(json!({
+        "indexed": indexed,
+        "analyzed": analyzed,
+        "embedded": embedded,
+        "skipped_large": skipped_large,
+        "vision_errors": vision_errors,
+        "embed_errors": embed_errors,
+        "memory_reachable": memory_up,
+        "embed_model": embed_model,
+    })))
+}
+
+#[cfg(test)]
+mod split_vision_reply_tests {
+    use super::split_vision_reply;
+
+    #[test]
+    fn splits_caption_and_ocr() {
+        let reply = "A cat on a red rug near a window.\nOCR: Welcome Home";
+        let (caption, ocr) = split_vision_reply(reply);
+        assert_eq!(caption, "A cat on a red rug near a window.");
+        assert_eq!(ocr.as_deref(), Some("Welcome Home"));
+    }
+
+    #[test]
+    fn handles_missing_marker() {
+        let reply = "A wide landscape photo.";
+        let (caption, ocr) = split_vision_reply(reply);
+        assert_eq!(caption, "A wide landscape photo.");
+        assert!(ocr.is_none());
+    }
+
+    #[test]
+    fn treats_none_as_absent_ocr() {
+        let reply = "An abstract painting.\nOCR: none";
+        let (caption, ocr) = split_vision_reply(reply);
+        assert_eq!(caption, "An abstract painting.");
+        assert!(ocr.is_none());
+    }
+
+    #[test]
+    fn only_splits_on_line_start_marker() {
+        // An inline "OCR:" inside the caption must not be split on —
+        // we only accept it at the start of the reply or a new line.
+        let reply = "Note: the author writes OCR: is fine in-line.";
+        let (caption, ocr) = split_vision_reply(reply);
+        assert_eq!(caption, "Note: the author writes OCR: is fine in-line.");
+        assert!(ocr.is_none());
+    }
 }

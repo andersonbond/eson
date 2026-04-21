@@ -1303,6 +1303,32 @@ pub fn provider_ui_defaults(expose_secrets: bool) -> Value {
             _ => "gemma4:e4b".to_string(),
         });
 
+    // Embeddings routing — read-only in the UI for now. Mirrors the
+    // resolution in [`crate::embedder::EmbedClient::from_env`] so the
+    // Settings panel shows exactly what the agent + sidecars will use
+    // for `scan_images` indexing and the `search_images` LLM tool.
+    // Kept in sync with that client on purpose; changing one without
+    // the other would desync the UI from runtime behavior.
+    let embed_model = std::env::var("ESON_EMBED_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "qwen3-embedding:4b".to_string());
+    let embed_base_raw = std::env::var("ESON_EMBED_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+    let embed_base = embed_base_raw
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
+    let embed_provider = std::env::var("ESON_EMBED_PROVIDER")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ollama".to_string());
+
     json!({
         "anthropic": {
             "model": anth.as_ref().map(|a| a.model.clone()).unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string()),
@@ -1321,6 +1347,11 @@ pub fn provider_ui_defaults(expose_secrets: bool) -> Value {
         "vision": {
             "provider": vision_provider,
             "model": vision_model,
+        },
+        "embeddings": {
+            "provider": embed_provider,
+            "model": embed_model,
+            "base_url": embed_base,
         },
     })
 }

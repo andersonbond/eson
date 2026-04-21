@@ -2,7 +2,9 @@
 //! optional workspace-scoped shell (Unix / macOS).
 
 use crate::agent_memory::{AgentMemory, MemoryType};
+use crate::embedder::EmbedClient;
 use crate::learnings;
+use crate::memory_client::MemoryClient;
 use crate::skills::{load_skill_body, list_all_skills, parse_page_list};
 use crate::vision;
 use crate::workspace::WorkspaceRoot;
@@ -27,6 +29,14 @@ pub struct ToolContext<'a> {
     /// then merged with `ESON_VISION_*` env vars by the caller. Lets the
     /// user pick Ollama / Anthropic / OpenAI without restarting the agent.
     pub vision: &'a vision::VisionConfig,
+    /// Text embedder used by `search_images` to vectorize the natural
+    /// language query before scoring it against `image_embeddings`.
+    pub embedder: &'a EmbedClient,
+    /// HTTP client for the `eson-memory` sidecar; used by
+    /// `search_images` to run the cosine top-K query. When the sidecar
+    /// is down the tool returns an explanatory error instead of
+    /// silently returning 0 hits.
+    pub memory_client: &'a MemoryClient,
 }
 
 fn queue_socket(ctx: &ToolContext, event: &str, payload: Value) {
@@ -276,6 +286,27 @@ pub fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "search_images",
+            "description": "Semantic search over indexed workspace images (uses captions + OCR embedded with the local text model). Returns the top-K matches with workspace-relative path, caption, OCR snippet, and similarity score. Run `POST /ingestion/scan-images` first if you expect results but get none.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Natural-language description of what you are looking for (e.g. 'invoices from April', 'screenshots with error dialogs')."
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "How many hits to return (default 5)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
             "name": "analyze_visual",
             "description": "Local multimodal understanding via Ollama: images (png/jpg/jpeg/gif/webp) or PDF pages rasterized with pdftoppm. Returns JSON text summary.",
             "input_schema": {
@@ -341,6 +372,7 @@ pub fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> String {
         "record_learning" => tool_record_learning(ctx, input),
         "propose_skill" => tool_propose_skill(ctx, input),
         "render_chart" => tool_render_chart(ctx, input),
+        "search_images" => tool_search_images(ctx, input),
         "analyze_visual" => tool_analyze_visual(ctx, input),
         "pdf_to_table" => tool_pdf_to_table(ctx, input),
         #[cfg(unix)]
@@ -1106,6 +1138,75 @@ fn build_chart_html(chart_type: &str, title: &str, labels: &Value, series: &Valu
         ctype = ctype,
         title_json = title_json,
     )
+}
+
+/// Handler for the `search_images` tool.
+///
+/// Two async calls hide behind this synchronous facade — embedding
+/// the query and running the cosine search via the sidecar. Both are
+/// bridged onto the current Tokio runtime via `block_on`, which is
+/// safe because the tool dispatch is already wrapped in
+/// `tokio::task::block_in_place` (see `main.rs`).
+fn tool_search_images(ctx: &ToolContext, input: &Value) -> String {
+    let Some(query) = input.get("query").and_then(|v| v.as_str()) else {
+        return "error: missing required field `query`".to_string();
+    };
+    let query = query.trim();
+    if query.is_empty() {
+        return "error: `query` must be non-empty".to_string();
+    }
+    let top_k = input
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+
+    let rt = tokio::runtime::Handle::current();
+    let vec = match rt.block_on(ctx.embedder.embed(query)) {
+        Ok(v) => v,
+        Err(e) => return format!("error: embed query: {e}"),
+    };
+    let hits = match rt.block_on(ctx.memory_client.search_images(
+        ctx.embedder.model(),
+        &vec,
+        top_k,
+    )) {
+        Ok(h) => h,
+        Err(e) => return format!(
+            "error: sidecar search_images: {e} (is eson-memory running?)"
+        ),
+    };
+
+    let ws_root = ctx.workspace.root();
+    let results: Vec<Value> = hits
+        .into_iter()
+        .map(|h| {
+            // `source_path` is stored as workspace-relative already, but
+            // some legacy rows may have been written with absolute
+            // paths — normalize defensively so the LLM always sees a
+            // relative path it can hand to `workspace_read` / display.
+            let rel = match std::path::Path::new(&h.source_path).strip_prefix(ws_root) {
+                Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                Err(_) => h.source_path.clone(),
+            };
+            json!({
+                "rel_path": rel,
+                "image_id": h.image_id,
+                "caption": h.caption,
+                "ocr_snippet": h.ocr_snippet,
+                "score": h.score,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json!({
+        "query": query,
+        "top_k": top_k,
+        "model": ctx.embedder.model(),
+        "dim": vec.len(),
+        "results": results,
+    }))
+    .unwrap_or_else(|e| format!("error: serialize: {e}"))
 }
 
 fn tool_analyze_visual(ctx: &ToolContext, input: &Value) -> String {

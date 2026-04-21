@@ -215,8 +215,63 @@ impl ServicesState {
 
 const OLLAMA_TARGET_MODEL: &str = "gemma4:e4b";
 
+/// Desktop app bundles often inherit a **minimal** `PATH` (especially on macOS),
+/// so `ollama` installed via Homebrew (`/opt/homebrew/bin`) is not found unless
+/// we prepend the usual locations. Optional `OLLAMA_PATH`: absolute path to the
+/// `ollama` binary **or** to the directory containing it.
+fn augmented_path_for_ollama_cli() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+    let mut prefixes: Vec<String> = Vec::new();
+    if let Ok(raw) = std::env::var("OLLAMA_PATH") {
+        let p = PathBuf::from(raw.trim());
+        if p.is_file() {
+            if let Some(parent) = p.parent() {
+                prefixes.push(parent.to_string_lossy().into_owned());
+            }
+        } else if p.is_dir() {
+            prefixes.push(p.to_string_lossy().into_owned());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        prefixes.push("/opt/homebrew/bin".into());
+        prefixes.push("/usr/local/bin".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        prefixes.push("/usr/local/bin".into());
+        prefixes.push("/usr/bin".into());
+        if let Ok(home) = std::env::var("HOME") {
+            prefixes.push(format!("{home}/.local/bin"));
+            prefixes.push(format!("{home}/.linuxbrew/bin"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            prefixes.push(format!("{la}\\Programs\\Ollama"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            prefixes.push(format!("{pf}\\Ollama"));
+        }
+    }
+    if prefixes.is_empty() {
+        return base;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let sep = ';';
+        format!("{}{}{}", prefixes.join(&sep.to_string()), sep, base)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("{}:{}", prefixes.join(":"), base)
+    }
+}
+
 fn ollama_cmd_exists() -> bool {
     std::process::Command::new("ollama")
+        .env("PATH", augmented_path_for_ollama_cli())
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -232,7 +287,11 @@ fn ollama_running_probe() -> bool {
 }
 
 fn ollama_model_exists(model: &str) -> bool {
-    let Ok(out) = std::process::Command::new("ollama").arg("list").output() else {
+    let Ok(out) = std::process::Command::new("ollama")
+        .env("PATH", augmented_path_for_ollama_cli())
+        .arg("list")
+        .output()
+    else {
         return false;
     };
     if !out.status.success() {
@@ -244,6 +303,7 @@ fn ollama_model_exists(model: &str) -> bool {
 
 fn run_shell(script: &str) -> Result<String, String> {
     let out = std::process::Command::new("sh")
+        .env("PATH", augmented_path_for_ollama_cli())
         .arg("-lc")
         .arg(script)
         .output()
@@ -430,6 +490,7 @@ async fn install_ollama_with_model(app: tauri::AppHandle) -> Result<OllamaStatus
                         false,
                     );
                     let pull = std::process::Command::new("ollama")
+                        .env("PATH", augmented_path_for_ollama_cli())
                         .arg("pull")
                         .arg(OLLAMA_TARGET_MODEL)
                         .output()
