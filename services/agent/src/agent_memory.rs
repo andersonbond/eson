@@ -7,6 +7,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// NOTE: the `idx_agent_memory_type` index references the
+// `memory_type` column and is created **after** the additive migration
+// in `open()`. Pre-existing `db/memory.db` files still have the legacy
+// schema without the column until we run `ALTER TABLE`, so creating the
+// index inline here would blow up the first boot after an upgrade.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -15,7 +20,8 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     body TEXT NOT NULL DEFAULT '',
     topics TEXT NOT NULL DEFAULT '[]',
     importance REAL NOT NULL DEFAULT 0.5,
-    source TEXT NOT NULL DEFAULT 'agent'
+    source TEXT NOT NULL DEFAULT 'agent',
+    memory_type TEXT NOT NULL DEFAULT 'episodic'
 );
 CREATE INDEX IF NOT EXISTS idx_agent_memory_created ON agent_memory(created_at_ms DESC);
 
@@ -44,6 +50,46 @@ pub struct MemoryRow {
     pub topics: String,
     pub importance: f64,
     pub source: String,
+    /// `episodic` (time-bound lived events) or `semantic` (generalized
+    /// durable knowledge). Mirrors the cognitive inspiration behind the
+    /// 12h consolidation pass; defaults to `episodic` for legacy rows
+    /// written before the schema migration landed.
+    pub memory_type: String,
+}
+
+/// Allowed `memory_type` values. Kept as a tiny enum to avoid
+/// string-typing drift across the store / recall / consolidation code
+/// paths; new kinds (e.g. `procedural`) can be added here first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryType {
+    Episodic,
+    Semantic,
+}
+
+impl MemoryType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemoryType::Episodic => "episodic",
+            MemoryType::Semantic => "semantic",
+        }
+    }
+
+    /// Parse a user-facing string (`episodic` / `semantic`) with
+    /// tolerant aliasing. Returns `None` for anything we don't want
+    /// to silently accept — the caller should then reject the write.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "episodic" | "episode" | "event" => Some(MemoryType::Episodic),
+            "semantic" | "rule" | "fact" => Some(MemoryType::Semantic),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MemoryType {
+    fn default() -> Self {
+        MemoryType::Episodic
+    }
 }
 
 pub struct AgentMemory {
@@ -61,6 +107,29 @@ impl AgentMemory {
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
+        // Additive migration for existing `db/memory.db` files created
+        // before the `memory_type` column existed. SQLite's
+        // `ALTER TABLE … ADD COLUMN` is idempotent-by-intent here: we
+        // ignore a "duplicate column" error so fresh installs (which
+        // already created the column via `SCHEMA`) and upgrades both
+        // succeed. Any other failure propagates so schema drift is
+        // loud rather than silent.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE agent_memory ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'episodic'",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("migrate memory_type: {msg}"));
+            }
+        }
+        // Index creation is deferred until after the migration so
+        // pre-existing DBs gain the column first.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_agent_memory_type \
+             ON agent_memory(memory_type, created_at_ms DESC);",
+        )
+        .map_err(|e| format!("create memory_type index: {e}"))?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -78,6 +147,10 @@ impl AgentMemory {
             .unwrap_or(0)
     }
 
+    /// Legacy helper: stores a row with the default memory type
+    /// (`episodic`). New callers should prefer
+    /// [`Self::store_typed`] so episodic vs semantic writes are
+    /// distinguishable in later queries / consolidation passes.
     pub fn store(
         &self,
         summary: &str,
@@ -86,6 +159,29 @@ impl AgentMemory {
         importance: f64,
         source: &str,
     ) -> Result<i64, String> {
+        self.store_typed(
+            summary,
+            body,
+            topics_json,
+            importance,
+            source,
+            MemoryType::Episodic,
+        )
+    }
+
+    /// Canonical write path. `memory_type` controls whether this row
+    /// represents a time-bound episode or a generalized rule; the
+    /// 12h consolidation skill is expected to call this directly
+    /// with an explicit value.
+    pub fn store_typed(
+        &self,
+        summary: &str,
+        body: &str,
+        topics_json: &str,
+        importance: f64,
+        source: &str,
+        memory_type: MemoryType,
+    ) -> Result<i64, String> {
         let summary = summary.trim();
         if summary.is_empty() {
             return Err("summary must not be empty".into());
@@ -93,8 +189,8 @@ impl AgentMemory {
         let imp = importance.clamp(0.0, 1.0);
         let g = self.conn.lock().map_err(|e| e.to_string())?;
         g.execute(
-            "INSERT INTO agent_memory (created_at_ms, summary, body, topics, importance, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO agent_memory (created_at_ms, summary, body, topics, importance, source, memory_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 Self::now_ms(),
                 summary,
@@ -102,6 +198,7 @@ impl AgentMemory {
                 topics_json.trim(),
                 imp,
                 source.trim(),
+                memory_type.as_str(),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -110,19 +207,45 @@ impl AgentMemory {
 
     /// Rank rows by simple token overlap on summary + body (no embeddings).
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryRow>, String> {
+        self.recall_filtered(query, limit, None)
+    }
+
+    /// Same as [`Self::recall`] but with an optional `memory_type`
+    /// filter (e.g. only `semantic` rules). Used by the 12h
+    /// consolidation pass to focus on one memory track at a time and
+    /// by the LLM tool when the caller asks for a specific kind.
+    pub fn recall_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        memory_type: Option<MemoryType>,
+    ) -> Result<Vec<MemoryRow>, String> {
         let limit = limit.clamp(1, 100);
         let g = self.conn.lock().map_err(|e| e.to_string())?;
         let q = query.trim();
         if q.is_empty() {
-            let mut stmt = g
-                .prepare(
-                    "SELECT id, created_at_ms, summary, body, topics, importance, source
+            let (sql, filter): (&str, Option<&'static str>) = match memory_type {
+                Some(_) => (
+                    "SELECT id, created_at_ms, summary, body, topics, importance, source, memory_type
+                     FROM agent_memory WHERE memory_type = ?2 ORDER BY created_at_ms DESC LIMIT ?1",
+                    memory_type.map(|m| m.as_str()),
+                ),
+                None => (
+                    "SELECT id, created_at_ms, summary, body, topics, importance, source, memory_type
                      FROM agent_memory ORDER BY created_at_ms DESC LIMIT ?1",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(params![limit as i64], row_to_memory)
-                .map_err(|e| e.to_string())?;
+                    None,
+                ),
+            };
+            let mut stmt = g.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = if let Some(mt) = filter {
+                stmt.query_map(params![limit as i64, mt], row_to_memory)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Vec<_>>()
+            } else {
+                stmt.query_map(params![limit as i64], row_to_memory)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Vec<_>>()
+            };
             let mut v = Vec::new();
             for r in rows {
                 v.push(r.map_err(|e| e.to_string())?);
@@ -137,15 +260,29 @@ impl AgentMemory {
             .take(32)
             .collect();
 
-        let mut stmt = g
-            .prepare(
-                "SELECT id, created_at_ms, summary, body, topics, importance, source
+        let (scan_sql, filter): (&str, Option<&'static str>) = match memory_type {
+            Some(_) => (
+                "SELECT id, created_at_ms, summary, body, topics, importance, source, memory_type
+                 FROM agent_memory WHERE memory_type = ?1",
+                memory_type.map(|m| m.as_str()),
+            ),
+            None => (
+                "SELECT id, created_at_ms, summary, body, topics, importance, source, memory_type
                  FROM agent_memory",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], row_to_memory)
-            .map_err(|e| e.to_string())?;
+                None,
+            ),
+        };
+
+        let mut stmt = g.prepare(scan_sql).map_err(|e| e.to_string())?;
+        let rows = if let Some(mt) = filter {
+            stmt.query_map(params![mt], row_to_memory)
+                .map_err(|e| e.to_string())?
+                .collect::<Vec<_>>()
+        } else {
+            stmt.query_map([], row_to_memory)
+                .map_err(|e| e.to_string())?
+                .collect::<Vec<_>>()
+        };
 
         let mut scored: Vec<(i32, MemoryRow)> = Vec::new();
         for r in rows {
@@ -177,7 +314,7 @@ impl AgentMemory {
         let g = self.conn.lock().map_err(|e| e.to_string())?;
         let row = g
             .query_row(
-                "SELECT id, created_at_ms, summary, body, topics, importance, source
+                "SELECT id, created_at_ms, summary, body, topics, importance, source, memory_type
                  FROM agent_memory WHERE id = ?1",
                 params![id],
                 row_to_memory,
@@ -313,6 +450,11 @@ impl AgentMemory {
 }
 
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
+    // Tolerate rows read via queries that don't project `memory_type`
+    // (older callers / get_by_id variants). SQLite returns an index
+    // error when the column is absent; fall back to the default so
+    // legacy paths keep working.
+    let memory_type: String = row.get::<_, String>(7).unwrap_or_else(|_| "episodic".into());
     Ok(MemoryRow {
         id: row.get(0)?,
         created_at_ms: row.get(1)?,
@@ -321,6 +463,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
         topics: row.get(4)?,
         importance: row.get(5)?,
         source: row.get(6)?,
+        memory_type,
     })
 }
 
@@ -338,6 +481,52 @@ mod tests {
         let rows = m.recall("greet", 5).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary, "greet");
+        assert_eq!(rows[0].memory_type, "episodic");
+    }
+
+    #[test]
+    fn memory_type_round_trip_and_filter() {
+        let dir = std::env::temp_dir().join(format!("eson-mem-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let m = AgentMemory::open(dir.join("memory.db")).unwrap();
+        m.store_typed(
+            "user likes terse replies",
+            "",
+            r#"["pref"]"#,
+            0.8,
+            "12h-cron",
+            MemoryType::Semantic,
+        )
+        .unwrap();
+        m.store_typed(
+            "window: morning shift",
+            "ran 3 tool calls",
+            r#"["digest"]"#,
+            0.5,
+            "12h-cron",
+            MemoryType::Episodic,
+        )
+        .unwrap();
+        let all = m.recall("", 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let sem_only = m
+            .recall_filtered("", 10, Some(MemoryType::Semantic))
+            .unwrap();
+        assert_eq!(sem_only.len(), 1);
+        assert_eq!(sem_only[0].memory_type, "semantic");
+        let epi_only = m
+            .recall_filtered("", 10, Some(MemoryType::Episodic))
+            .unwrap();
+        assert_eq!(epi_only.len(), 1);
+        assert_eq!(epi_only[0].memory_type, "episodic");
+    }
+
+    #[test]
+    fn memory_type_parse_is_tolerant() {
+        assert_eq!(MemoryType::parse("Semantic"), Some(MemoryType::Semantic));
+        assert_eq!(MemoryType::parse("  EPISODIC "), Some(MemoryType::Episodic));
+        assert_eq!(MemoryType::parse("rule"), Some(MemoryType::Semantic));
+        assert_eq!(MemoryType::parse("weird"), None);
     }
 }
 

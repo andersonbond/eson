@@ -182,3 +182,24 @@ pub fn inbox_auto_enabled() -> bool {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_minutes_and_hours() {
+        assert_eq!(parse_interval_seconds("every:15m"), Some(900));
+        assert_eq!(parse_interval_seconds("every:2h"), Some(2 * 3600));
+        // Critical for the 12h memory consolidation cron.
+        assert_eq!(parse_interval_seconds("every:12h"), Some(12 * 3600));
+        assert_eq!(parse_interval_seconds("every:24h"), Some(24 * 3600));
+    }
+
+    #[test]
+    fn rejects_daily_time_and_garbage() {
+        assert_eq!(parse_interval_seconds("14:30"), None);
+        assert_eq!(parse_interval_seconds("every:forever"), None);
+        assert_eq!(parse_interval_seconds(""), None);
+    }
+}

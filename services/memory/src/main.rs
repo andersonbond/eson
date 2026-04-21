@@ -79,6 +79,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // NOTE: the `memory_type` index is created *after* the additive
+    // `ALTER TABLE` migration below so that pre-existing databases (whose
+    // `events_raw` table lacks the column) do not fail the batch during
+    // `CREATE INDEX`. Fresh databases still get the column via the
+    // `CREATE TABLE` default.
     conn.execute_batch(
         r#"
         PRAGMA foreign_keys = ON;
@@ -87,7 +92,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL,
             kind TEXT NOT NULL,
-            payload TEXT NOT NULL
+            payload TEXT NOT NULL,
+            memory_type TEXT NOT NULL DEFAULT 'episodic'
         );
 
         CREATE TABLE IF NOT EXISTS world_model (
@@ -167,6 +173,24 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_images_path ON images(source_path);
         "#,
     )?;
+    // Additive migration for older databases that predate the
+    // `memory_type` column. SQLite has no `IF NOT EXISTS` for
+    // columns so we try and swallow the "duplicate column" error.
+    if let Err(e) = conn.execute(
+        "ALTER TABLE events_raw ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'episodic'",
+        [],
+    ) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+    // Index creation is deferred until after the migration so
+    // pre-existing DBs successfully gain the column first.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_events_raw_type \
+         ON events_raw(memory_type, created_at DESC);",
+    )?;
     Ok(())
 }
 
@@ -200,6 +224,11 @@ struct IngestBody {
     text: String,
     #[serde(default)]
     kind: String,
+    /// Cognitive memory tier: `episodic` (time-bound event) or
+    /// `semantic` (generalized knowledge). Defaults to `episodic`.
+    /// Invalid values are rejected so schema drift is loud.
+    #[serde(default)]
+    memory_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -218,11 +247,18 @@ async fn ingest(
     } else {
         body.kind
     };
+    let memory_type = match body.memory_type.as_deref().map(str::trim) {
+        None | Some("") => "episodic".to_string(),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "episodic" | "semantic" => raw.to_ascii_lowercase(),
+            _ => return Err(StatusCode::BAD_REQUEST),
+        },
+    };
     let payload = serde_json::json!({ "text": body.text }).to_string();
     let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
-        "INSERT INTO events_raw (id, created_at, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![id, now, kind, payload],
+        "INSERT INTO events_raw (id, created_at, kind, payload, memory_type) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![id, now, kind, payload, memory_type],
     )
     .map_err(|e| {
         warn!("ingest: {e}");
@@ -300,25 +336,63 @@ struct MemoryRow {
     id: String,
     created_at: String,
     kind: String,
+    memory_type: String,
 }
 
-async fn list_memories(State(state): State<AppState>) -> Json<Vec<MemoryRow>> {
-    let db = state.db.lock().unwrap();
-    let mut stmt = db
-        .prepare("SELECT id, created_at, kind FROM events_raw ORDER BY created_at DESC LIMIT 200")
-        .unwrap();
-    let rows: Vec<MemoryRow> = stmt
-        .query_map([], |r| {
-            Ok(MemoryRow {
-                id: r.get(0)?,
-                created_at: r.get(1)?,
-                kind: r.get(2)?,
-            })
+#[derive(Deserialize)]
+struct ListMemoriesParams {
+    /// Optional filter: return only rows of this memory type
+    /// (`episodic` or `semantic`). Unknown values return 400.
+    #[serde(default)]
+    memory_type: Option<String>,
+}
+
+async fn list_memories(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<ListMemoriesParams>,
+) -> Result<Json<Vec<MemoryRow>>, StatusCode> {
+    let filter = match params.memory_type.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "episodic" | "semantic" => Some(raw.to_ascii_lowercase()),
+            _ => return Err(StatusCode::BAD_REQUEST),
+        },
+    };
+    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mapper = |r: &rusqlite::Row<'_>| {
+        Ok(MemoryRow {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            kind: r.get(2)?,
+            memory_type: r.get(3)?,
         })
-        .unwrap()
-        .filter_map(|x| x.ok())
-        .collect();
-    Json(rows)
+    };
+    let rows: Vec<MemoryRow> = if let Some(mt) = filter {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, created_at, kind, memory_type FROM events_raw
+                 WHERE memory_type = ?1 ORDER BY created_at DESC LIMIT 200",
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let iter = stmt
+            .query_map([mt], mapper)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let collected: Vec<MemoryRow> = iter.filter_map(|x| x.ok()).collect();
+        collected
+    } else {
+        let mut stmt = db
+            .prepare(
+                "SELECT id, created_at, kind, memory_type FROM events_raw
+                 ORDER BY created_at DESC LIMIT 200",
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let iter = stmt
+            .query_map([], mapper)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let collected: Vec<MemoryRow> = iter.filter_map(|x| x.ok()).collect();
+        collected
+    };
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]

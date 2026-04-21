@@ -11,6 +11,10 @@ use dashmap::DashMap;
 use eson_agent::{
     agent_loop,
     agent_memory::{AgentMemory, MemoryRow},
+    consolidation::{
+        build_digest_bundle, build_llm_message, should_record_event_kind, ChatSnippet,
+        RecentEvent, RecentEventsBuffer, CONSOLIDATION_SKILL_ID, DEFAULT_WINDOW_SECS,
+    },
     llm::{
         anthropic_client_or_none, max_llm_tool_rounds, ollama_client_or_none, openai_client_or_none,
         provider_ui_defaults, AnthropicClient, AnthropicConfig, ApiMessage, OpenAiCompatClient,
@@ -53,6 +57,13 @@ struct AppState {
     skills_dir: PathBuf,
     tool_socket_queue: Arc<Mutex<Vec<(String, Value)>>>,
     background_config: Arc<RwLock<BackgroundConfig>>,
+    /// Bounded rolling log of orchestrator events (tool calls, turn
+    /// boundaries, provider fallbacks, etc.) used by the 12h memory
+    /// consolidation pass to build its evidence bundle without having
+    /// to persist a heavy activity log to disk. See
+    /// [`consolidation::should_record_event_kind`] for the kinds
+    /// that are retained.
+    recent_events: Arc<Mutex<RecentEventsBuffer>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -95,8 +106,226 @@ fn json_pretty_preview(v: &Value, max: usize) -> String {
         .unwrap_or_else(|_| "{}".to_string())
 }
 
-async fn orchestrator_emit(io: &SocketIo, payload: &Value) {
+/// Low-level socket emit. Prefer [`orchestrator_emit`] (which also
+/// records events into the consolidation buffer) for new call sites.
+async fn orchestrator_emit_raw(io: &SocketIo, payload: &Value) {
     let _ = io.emit("orchestrator", payload).await;
+}
+
+/// Pull the consolidation-relevant fields out of an orchestrator
+/// payload and push them into the rolling event buffer. We
+/// intentionally summarize to short strings rather than cloning the
+/// whole payload so the buffer stays cheap even under event storms
+/// (see [`consolidation::RecentEventsBuffer`]).
+fn record_event_for_consolidation(state: &AppState, payload: &Value) {
+    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if !should_record_event_kind(kind) {
+        return;
+    }
+    let session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let (summary, tag) = summarize_event(kind, payload);
+    let Ok(mut buf) = state.recent_events.lock() else {
+        return;
+    };
+    buf.push(RecentEvent {
+        ts_ms: 0, // filled in by the buffer to honor now_ms()
+        kind: kind.to_string(),
+        session_id,
+        summary,
+        tag,
+    });
+}
+
+/// Per-kind textual summary used in the rolling event buffer. The
+/// goal is a one-line excerpt the LLM can reason about later — long
+/// enough to recognize recurring patterns, short enough to keep the
+/// buffer bounded.
+fn summarize_event(kind: &str, payload: &Value) -> (String, Option<String>) {
+    let get = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "tool" | "tool_begin" => {
+            let name = get("tool");
+            let cmd = get("command");
+            let preview = get("result_preview");
+            let ok = payload.get("ok").and_then(|v| v.as_bool());
+            let status = match ok {
+                Some(true) => "ok",
+                Some(false) => "fail",
+                None => "run",
+            };
+            let body = if !preview.is_empty() {
+                format!("{name} ({cmd}) [{status}] — {}", truncate_preview(preview, 140))
+            } else {
+                format!("{name} ({cmd}) [{status}]")
+            };
+            (body, Some(name.to_string()))
+        }
+        "turn_begin" => {
+            let u = get("user_preview");
+            (format!("user: {}", truncate_preview(u, 200)), None)
+        }
+        "turn_end" => {
+            let rounds = payload.get("rounds").and_then(|v| v.as_i64()).unwrap_or(0);
+            let chars = payload
+                .get("answer_chars")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            (
+                format!("assistant turn finished (rounds={rounds}, chars={chars})"),
+                None,
+            )
+        }
+        "turn_cancel" => ("turn cancelled".to_string(), None),
+        "background_turn" => {
+            let skill = get("skill_id");
+            (format!("background turn · {skill}"), Some(skill.to_string()))
+        }
+        "inbox_finalize" => {
+            let path = get("rel_path");
+            let outcome = get("outcome");
+            (format!("inbox {outcome}: {path}"), Some(outcome.to_string()))
+        }
+        "provider_fallback" => {
+            let from = get("from");
+            let to = get("to");
+            (format!("fallback {from} → {to}"), Some(to.to_string()))
+        }
+        "llm_call_end" => {
+            let provider = get("provider");
+            let model = get("model");
+            let ok = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            let err = get("error");
+            let tail = if ok {
+                "ok".to_string()
+            } else if !err.is_empty() {
+                format!("err: {}", truncate_preview(err, 120))
+            } else {
+                "err".to_string()
+            };
+            (format!("{provider}/{model} {tail}"), Some(provider.to_string()))
+        }
+        "chart_render" => {
+            let path = get("rel_path");
+            (format!("chart rendered: {path}"), Some("chart".to_string()))
+        }
+        "consolidation_begin" | "consolidation_end" => {
+            let phase = kind;
+            let kept = payload.get("kept").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let considered = payload
+                .get("considered_total")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            (
+                format!("{phase} considered={considered} kept={kept}"),
+                Some("consolidation".into()),
+            )
+        }
+        _ => (kind.to_string(), None),
+    }
+}
+
+/// Emit an orchestrator event **and** record it into the rolling
+/// consolidation buffer. This is the canonical emit path — every
+/// `kind` worth retaining for the 12h memory consolidation pass
+/// ends up in the rolling buffer automatically; low-signal kinds
+/// (streaming deltas) are filtered by
+/// [`consolidation::should_record_event_kind`].
+async fn orchestrator_emit(state: &AppState, payload: &Value) {
+    record_event_for_consolidation(state, payload);
+    orchestrator_emit_raw(&state.io, payload).await;
+}
+
+/// Snapshot the rolling event buffer within the requested window.
+/// Returns an owned `Vec` so the caller can drop the lock before
+/// doing any expensive formatting.
+fn snapshot_events_since(state: &AppState, window_secs: u64) -> Vec<RecentEvent> {
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        .saturating_sub(window_secs.saturating_mul(1000));
+    let Ok(buf) = state.recent_events.lock() else {
+        return Vec::new();
+    };
+    buf.snapshot_since(cutoff)
+}
+
+/// Flatten the tail of every live session's message log into recent
+/// chat snippets. We don't have per-message timestamps, so "recent"
+/// here is approximated by "the last few turns in each live
+/// session" — good enough for the 12h digest because the orchestrator
+/// also injects event timestamps for cross-reference.
+fn snapshot_recent_chat(state: &AppState, per_session_tail: usize) -> Vec<ChatSnippet> {
+    let mut out: Vec<ChatSnippet> = Vec::new();
+    for entry in state.sessions.iter() {
+        let sid = entry.key().clone();
+        let msgs = &entry.value().messages;
+        let tail_start = msgs.len().saturating_sub(per_session_tail);
+        for m in &msgs[tail_start..] {
+            let Some(text) = flatten_message_text(&m.content) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            out.push(ChatSnippet {
+                session_id: sid.clone(),
+                role: m.role.clone(),
+                text,
+            });
+        }
+    }
+    out
+}
+
+/// Best-effort plain-text extraction from an `ApiMessage::content`
+/// value. Handles the two shapes the chat providers return:
+/// a bare string (user turns) and an array of content blocks
+/// (assistant tool_use / tool_result turns). We stringify the first
+/// text block we find; anything else is ignored.
+fn flatten_message_text(content: &Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        for block in arr {
+            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Cheap count of durable memory rows — used to diff around the
+/// consolidation LLM turn so the orchestrator marker can report
+/// exactly how many new rows were persisted.
+fn count_memory_rows(state: &AppState) -> usize {
+    state
+        .agent_memory
+        .recall("", 100)
+        .map(|rows| rows.len())
+        .unwrap_or(0)
+}
+
+/// Count the number of entries in the `.learnings/` journals. Used
+/// for the "kept" stat; checks summary line counts across all three
+/// files.
+fn count_learning_entries(state: &AppState) -> usize {
+    let dir = state.workspace.root().join(".learnings");
+    let mut n = 0usize;
+    for name in ["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+            // Each entry starts with `### {PREFIX}-{millis}` on its
+            // own line. Counting the heading prefix is cheaper than
+            // full parsing and sufficient for "did new entries land?".
+            n += text.matches("\n### ").count();
+        }
+    }
+    n
 }
 
 #[derive(Clone, Default)]
@@ -541,6 +770,7 @@ async fn main() {
         skills_dir: skills_dir.clone(),
         tool_socket_queue: tool_socket_queue.clone(),
         background_config: background_config.clone(),
+        recent_events: Arc::new(Mutex::new(RecentEventsBuffer::default())),
     };
 
     let bg_state = state.clone();
@@ -696,14 +926,22 @@ fn tool_human_command(name: &str, input: &Value) -> String {
         }
         "store_memory" => {
             let s = input.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            let mt = input
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("episodic");
             format!(
-                "Store memory · {}",
+                "Store memory [{mt}] · {}",
                 truncate_preview(s, 100)
             )
         }
         "recall_memory" => {
             let q = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Search stored memories · {}", truncate_preview(q, 120))
+            let mt = input
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("any");
+            format!("Search stored memories [{mt}] · {}", truncate_preview(q, 120))
         }
         "run_terminal" => {
             let c = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -1034,7 +1272,7 @@ async fn execute_llm(
             Ok(answer) => {
                 if candidate != provider {
                     orchestrator_emit(
-                        &state.io,
+                        state,
                         &json!({
                             "kind": "provider_fallback",
                             "session_id": session_id,
@@ -1475,7 +1713,7 @@ async fn emit_llm_call_begin(
     endpoint: &str,
 ) {
     orchestrator_emit(
-        &state.io,
+        state,
         &json!({
             "kind": "llm_call_begin",
             "session_id": session_id,
@@ -1522,7 +1760,7 @@ async fn emit_llm_call_end(
             "error": err,
         }),
     };
-    orchestrator_emit(&state.io, &payload).await;
+    orchestrator_emit(state, &payload).await;
 }
 
 fn workspace_rel_path(state: &AppState, abs: &std::path::Path) -> Option<String> {
@@ -1617,25 +1855,134 @@ async fn background_loops(state: AppState) {
                     ..Default::default()
                 },
             );
-            let msg = format!(
-                "Background cron: execute skill `{}`. Call **skill_run** with skill_id `{}` then follow the markdown.",
-                skill.id, skill.id
-            );
-            orchestrator_emit(
-                &state.io,
-                &json!({
-                    "kind": "background_turn",
-                    "trigger": "cron",
-                    "skill_id": skill.id,
-                    "session_id": sid,
-                    "provider": provider_label(provider),
-                }),
-            )
-            .await;
+
+            // The 12h memory consolidation skill gets a richer prompt:
+            // the orchestrator pre-builds the evidence bundle so the
+            // LLM turn is deterministic and bounded. Every other cron
+            // skill keeps the legacy "run skill_run then follow the
+            // markdown" message.
+            let is_consolidation = skill.id == CONSOLIDATION_SKILL_ID;
+            let (msg, considered) = if is_consolidation {
+                let events = snapshot_events_since(&state, DEFAULT_WINDOW_SECS);
+                let chat = snapshot_recent_chat(&state, 60);
+                let bundle = build_digest_bundle(
+                    state.workspace.root(),
+                    state.agent_memory.as_ref(),
+                    &events,
+                    &chat,
+                    DEFAULT_WINDOW_SECS,
+                );
+                let considered_total = bundle.counts.events
+                    + bundle.counts.chat_turns
+                    + bundle.counts.artifacts
+                    + bundle.counts.learnings;
+
+                orchestrator_emit(
+                    &state,
+                    &json!({
+                        "kind": "consolidation_begin",
+                        "session_id": sid,
+                        "skill_id": skill.id,
+                        "provider": provider_label(provider),
+                        "window_hours": DEFAULT_WINDOW_SECS / 3600,
+                        "window_start_ms": bundle.window_start_ms,
+                        "window_end_ms": bundle.window_end_ms,
+                        "considered_total": considered_total,
+                        "considered": {
+                            "events": bundle.counts.events,
+                            "chat_turns": bundle.counts.chat_turns,
+                            "artifacts": bundle.counts.artifacts,
+                            "learnings": bundle.counts.learnings,
+                            "stored_snapshot": bundle.counts.stored_snapshot,
+                        },
+                        "empty": bundle.empty,
+                    }),
+                )
+                .await;
+
+                // Skip the LLM round entirely when nothing durable
+                // happened — the skill contract already says to reply
+                // "No action" in that case, so we save the round trip.
+                if bundle.empty {
+                    orchestrator_emit(
+                        &state,
+                        &json!({
+                            "kind": "consolidation_end",
+                            "session_id": sid,
+                            "skill_id": skill.id,
+                            "status": "skipped_empty_window",
+                            "considered_total": considered_total,
+                            "kept": 0,
+                        }),
+                    )
+                    .await;
+                    state.sessions.remove(&sid);
+                    agent_loop::after_cron_run(&skill, &ws_root);
+                    continue;
+                }
+                (build_llm_message(&bundle), considered_total)
+            } else {
+                let msg = format!(
+                    "Background cron: execute skill `{}`. Call **skill_run** with skill_id `{}` then follow the markdown.",
+                    skill.id, skill.id
+                );
+                (msg, 0)
+            };
+
+            if !is_consolidation {
+                orchestrator_emit(
+                    &state,
+                    &json!({
+                        "kind": "background_turn",
+                        "trigger": "cron",
+                        "skill_id": skill.id,
+                        "session_id": sid,
+                        "provider": provider_label(provider),
+                    }),
+                )
+                .await;
+            }
+
+            // Snapshot store_memory / record_learning counts BEFORE the
+            // turn so we can compute "kept" by diffing after it returns.
+            let (pre_mem, pre_lrn) = if is_consolidation {
+                (
+                    count_memory_rows(&state),
+                    count_learning_entries(&state),
+                )
+            } else {
+                (0, 0)
+            };
+
             let _permit = state.policy.acquire_tool_permit().await;
-            if let Err(e) = run_background_llm_turn(&state, &sid, &msg).await {
+            let turn_result = run_background_llm_turn(&state, &sid, &msg).await;
+            if let Err(ref e) = turn_result {
                 tracing::warn!(error = %e, skill = %skill.id, "background cron LLM failed");
             }
+
+            if is_consolidation {
+                let kept_mem = count_memory_rows(&state).saturating_sub(pre_mem);
+                let kept_lrn = count_learning_entries(&state).saturating_sub(pre_lrn);
+                let status = match &turn_result {
+                    Ok(_) => "ok",
+                    Err(_) => "llm_error",
+                };
+                orchestrator_emit(
+                    &state,
+                    &json!({
+                        "kind": "consolidation_end",
+                        "session_id": sid,
+                        "skill_id": skill.id,
+                        "status": status,
+                        "considered_total": considered,
+                        "kept": kept_mem + kept_lrn,
+                        "kept_memory": kept_mem,
+                        "kept_learnings": kept_lrn,
+                    }),
+                )
+                .await;
+            }
+
             state.sessions.remove(&sid);
             agent_loop::after_cron_run(&skill, &ws_root);
         }
@@ -1748,7 +2095,7 @@ fn inbox_notify_thread(state: AppState, rt: tokio::runtime::Handle) {
                      The orchestrator will move the source to `inbox/processed/<today>/` (or `inbox/failed/<today>/` on error) and append a one-liner to today's digest at `exports/reports/digest-<today>.md` — do NOT move or delete the source file yourself, and do NOT write the digest. Focus on producing the report and any artifacts. Reply with one short line summarizing what you did."
                 );
                 let _ = orchestrator_emit(
-                    &st.io,
+                    &st,
                     &json!({
                         "kind": "background_turn",
                         "trigger": "inbox",
@@ -1800,7 +2147,7 @@ async fn finalize_inbox_dispatch(
         let dest_rel: Option<String> = None;
         let _ = append_inbox_digest(&root, rel_path, skill_id, success, dest_rel.as_deref(), err.as_deref());
         let _ = orchestrator_emit(
-            &state.io,
+            state,
             &json!({
                 "kind": "inbox_finalize",
                 "path": rel_path,
@@ -1848,7 +2195,7 @@ async fn finalize_inbox_dispatch(
     }
 
     let _ = orchestrator_emit(
-        &state.io,
+        state,
         &json!({
             "kind": "inbox_finalize",
             "path": rel_path,
@@ -2019,7 +2366,7 @@ async fn session_message(
     let turn_id = Uuid::new_v4().to_string();
     let orchestration_start = std::time::Instant::now();
     orchestrator_emit(
-        &state.io,
+        &state,
         &json!({
             "kind": "turn_begin",
             "id": &turn_id,
@@ -2129,7 +2476,7 @@ async fn run_session_turn(
             rollback_session_user_turn(&state, &session_id);
             state.cancellations.remove(&session_id);
             orchestrator_emit(
-                &state.io,
+                &state,
                 &json!({
                     "kind": if cancelled { "turn_cancel" } else { "turn_error" },
                     "id": &turn_id,
@@ -2155,7 +2502,7 @@ async fn run_session_turn(
     }
 
     orchestrator_emit(
-        &state.io,
+        &state,
         &json!({
             "kind": "turn_end",
             "id": &turn_id,
@@ -2604,7 +2951,7 @@ async fn session_cancel(
         false
     };
     orchestrator_emit(
-        &state.io,
+        &state,
         &json!({
             "kind": "turn_cancel",
             "session_id": &body.session_id,
@@ -3103,7 +3450,7 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
     })?;
 
     orchestrator_emit(
-        &state.io,
+        &state,
         &json!({
             "kind": "image_scan_begin",
             "files_total": paths.len(),
@@ -3152,7 +3499,7 @@ async fn scan_images(State(state): State<AppState>) -> Result<Json<Value>, Statu
         .await;
 
     orchestrator_emit(
-        &state.io,
+        &state,
         &json!({
             "kind": "image_scan_end",
             "indexed": indexed,

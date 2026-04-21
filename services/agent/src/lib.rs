@@ -1,5 +1,6 @@
 pub mod agent_loop;
 pub mod agent_memory;
+pub mod consolidation;
 pub mod learnings;
 pub mod llm;
 pub mod memory_client;

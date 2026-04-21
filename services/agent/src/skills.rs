@@ -202,4 +202,20 @@ mod tests {
         let v = parse_page_list(Some("1-3"), 10, 10);
         assert_eq!(v, vec![1, 2, 3]);
     }
+
+    /// Pins the shipped 12h consolidation cron skill so the scheduler
+    /// can always find and enable it. Guards against accidental
+    /// frontmatter drift (typos in `cron:`, `enabled:`, or filename).
+    #[test]
+    fn consolidation_cron_skill_is_discoverable() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+        let all = list_all_skills(&root);
+        let entry = all
+            .iter()
+            .find(|s| s.id == "cron/memory-12h-consolidation")
+            .expect("consolidation skill must ship and be discoverable");
+        assert!(entry.enabled, "consolidation skill must be enabled by default");
+        assert_eq!(entry.cron.as_deref(), Some("every:12h"));
+        assert_eq!(entry.category, "cron");
+    }
 }

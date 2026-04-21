@@ -1,7 +1,7 @@
 //! Claude tool implementations scoped to [`WorkspaceRoot`] (sandbox) plus SQLite agent memory and
 //! optional workspace-scoped shell (Unix / macOS).
 
-use crate::agent_memory::AgentMemory;
+use crate::agent_memory::{AgentMemory, MemoryType};
 use crate::learnings;
 use crate::skills::{load_skill_body, list_all_skills, parse_page_list};
 use crate::vision;
@@ -133,7 +133,7 @@ pub fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "store_memory",
-            "description": "Persist a durable memory in the workspace SQLite database (db/memory.db) for future sessions. Use for user preferences, facts to remember, decisions, or reminders — like an always-on memory layer. Include a short summary; optional longer body and topic tags.",
+            "description": "Persist a durable memory in the workspace SQLite database (db/memory.db) for future sessions. Use for user preferences, facts to remember, decisions, or reminders — like an always-on memory layer. Include a short summary; optional longer body and topic tags. Set `memory_type` to `episodic` for a time-bound event / window summary or `semantic` for a generalized rule / fact (default: `episodic`).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -148,14 +148,19 @@ pub fn tool_specs() -> Vec<Value> {
                         "type": "number",
                         "description": "0.0–1.0 (default 0.5)."
                     },
-                    "source": { "type": "string", "description": "Optional provenance label." }
+                    "source": { "type": "string", "description": "Optional provenance label." },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["episodic", "semantic"],
+                        "description": "`episodic` = time-bound event/digest; `semantic` = generalized durable rule. Defaults to `episodic` when omitted."
+                    }
                 },
                 "required": ["summary"]
             }
         }),
         json!({
             "name": "recall_memory",
-            "description": "Search stored memories (db/memory.db) by keywords. Returns the best-matching rows with id, summary, body, topics, importance. Use before answering when prior preferences or facts may apply.",
+            "description": "Search stored memories (db/memory.db) by keywords. Returns the best-matching rows with id, summary, body, topics, importance, memory_type. Use before answering when prior preferences or facts may apply. Pass `memory_type` (`episodic` or `semantic`) to restrict the scan to one track.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -166,6 +171,11 @@ pub fn tool_specs() -> Vec<Value> {
                     "limit": {
                         "type": "integer",
                         "description": "Max rows (default 20, max 100)."
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["episodic", "semantic"],
+                        "description": "Optional filter: only return rows of this memory type."
                     }
                 },
                 "required": ["query"]
@@ -629,10 +639,25 @@ fn tool_store_memory(mem: &AgentMemory, input: &Value) -> String {
         .get("source")
         .and_then(|v| v.as_str())
         .unwrap_or("agent");
-    match mem.store(summary, body, &topics, importance, source) {
+    // `memory_type` is optional on the API, but when the caller sends
+    // a non-empty value that doesn't parse to one of the known kinds
+    // we reject the write rather than silently defaulting — a typo
+    // here would otherwise bypass the episodic/semantic distinction
+    // the 12h consolidation pass relies on.
+    let memory_type = match input.get("memory_type").and_then(|v| v.as_str()) {
+        None | Some("") => MemoryType::default(),
+        Some(raw) => match MemoryType::parse(raw) {
+            Some(mt) => mt,
+            None => return format!(
+                "error: invalid memory_type `{raw}` (expected `episodic` or `semantic`)"
+            ),
+        },
+    };
+    match mem.store_typed(summary, body, &topics, importance, source, memory_type) {
         Ok(id) => match serde_json::to_string_pretty(&json!({
             "ok": true,
             "id": id,
+            "memory_type": memory_type.as_str(),
             "db": mem.db_path().display().to_string(),
         })) {
             Ok(s) => s,
@@ -651,9 +676,19 @@ fn tool_recall_memory(mem: &AgentMemory, input: &Value) -> String {
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
-    match mem.recall(query, limit) {
+    let filter = match input.get("memory_type").and_then(|v| v.as_str()) {
+        None | Some("") => None,
+        Some(raw) => match MemoryType::parse(raw) {
+            Some(mt) => Some(mt),
+            None => return format!(
+                "error: invalid memory_type `{raw}` (expected `episodic` or `semantic`)"
+            ),
+        },
+    };
+    match mem.recall_filtered(query, limit, filter) {
         Ok(rows) => match serde_json::to_string_pretty(&json!({
             "memories": rows,
+            "memory_type_filter": filter.map(|m| m.as_str()),
             "db": mem.db_path().display().to_string(),
         })) {
             Ok(s) => s,
