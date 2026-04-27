@@ -1302,6 +1302,18 @@ pub fn provider_ui_defaults(expose_secrets: bool) -> Value {
                 .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string()),
             _ => "gemma4:e4b".to_string(),
         });
+    // Vision-only Ollama / OpenAI-compat base (mirrors `VisionConfig` env). Empty
+    // in the UI means "inherit the AI Provider Ollama URL" at runtime.
+    let vision_ollama_url = std::env::var("ESON_VISION_OLLAMA_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.trim()
+                .trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .to_string()
+        })
+        .unwrap_or_default();
 
     // Embeddings routing — read-only in the UI for now. Mirrors the
     // resolution in [`crate::embedder::EmbedClient::from_env`] so the
@@ -1347,6 +1359,7 @@ pub fn provider_ui_defaults(expose_secrets: bool) -> Value {
         "vision": {
             "provider": vision_provider,
             "model": vision_model,
+            "url": vision_ollama_url,
         },
         "embeddings": {
             "provider": embed_provider,

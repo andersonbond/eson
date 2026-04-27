@@ -2,8 +2,10 @@
 //!
 //! Three provider backends are supported:
 //!
-//! 1. **Ollama** (default, fully local) — talks to `/api/generate` on a
-//!    locally-running Ollama instance. The default model is `gemma4:e4b`.
+//! 1. **Ollama** (default, fully local) — tries native Ollama `POST /api/generate`
+//!    first, then **falls back** to OpenAI-shaped `POST /v1/chat/completions`
+//!    with `image_url` when the host is OpenAI-compatible only (e.g. mlx-lm).
+//!    The default model is `gemma4:e4b`.
 //! 2. **Anthropic** — Claude vision via `messages` with image content blocks.
 //! 3. **OpenAI** — GPT-4o family via `chat/completions` with `image_url`
 //!    data URIs.
@@ -60,12 +62,30 @@ pub struct VisionConfig {
     pub model: String,
     /// Required for `Ollama` — base URL **without** `/v1` suffix.
     pub ollama_base: String,
+    /// Bearer for OpenAI-compat vision fallback; matches chat (`OLLAMA_API_KEY` or `ollama`).
+    pub ollama_api_key: String,
     /// Required for `Anthropic` — empty string disables that branch.
     pub anthropic_api_key: String,
     /// Required for `Openai` — empty string disables that branch.
     pub openai_api_key: String,
     /// Base URL for OpenAI-compatible endpoint (defaults to api.openai.com).
     pub openai_base: String,
+}
+
+/// Picks from the Eson app Settings (session `settings` JSON). Empty
+/// strings mean "not set" for that field.
+pub struct SessionVisionPicks<'a> {
+    /// Vision → provider tab (e.g. `ollama`).
+    pub provider: Option<&'a str>,
+    /// Vision → model field — **non-empty** values override
+    /// `ESON_VISION_MODEL` in `.env`.
+    pub model: Option<&'a str>,
+    /// Vision → base URL — **non-empty** values override
+    /// `ESON_VISION_OLLAMA_URL` and (with `chat_ollama_url`) avoid env pinning
+    /// a different host.
+    pub vision_ollama_url: Option<&'a str>,
+    /// AI Provider → Ollama URL — when `vision_ollama_url` is empty.
+    pub chat_ollama_url: Option<&'a str>,
 }
 
 impl VisionConfig {
@@ -77,15 +97,64 @@ impl VisionConfig {
     /// - `ESON_VISION_PROVIDER`  — `"ollama" | "anthropic" | "openai"`
     /// - `ESON_VISION_MODEL`     — model id
     /// - `ESON_VISION_OLLAMA_URL` / `OLLAMA_BASE_URL`
+    /// - `OLLAMA_API_KEY` (OpenAI-compat fallback / bearer)
     /// - `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`
     /// - `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL`
     pub fn from_env() -> Self {
-        let provider = std::env::var("ESON_VISION_PROVIDER")
+        let (ollama_api_key, anthropic_api_key, openai_api_key, openai_base) =
+            Self::shared_credentials_from_env();
+        let provider = Self::provider_from_env();
+        let model = Self::model_from_env_for_provider(provider);
+        let ollama_base = Self::ollama_base_from_env();
+        Self {
+            provider,
+            model,
+            ollama_base,
+            ollama_api_key,
+            anthropic_api_key,
+            openai_api_key,
+            openai_base,
+        }
+    }
+
+    /// Per-field env strings shared by [`Self::from_env`] and
+    /// [`Self::from_session_picks`].
+    fn shared_credentials_from_env() -> (String, String, String, String) {
+        let ollama_api_key = std::env::var("OLLAMA_API_KEY")
             .ok()
-            .as_deref()
-            .and_then(parse_vision_provider)
-            .unwrap_or(VisionProvider::Ollama);
-        let model = std::env::var("ESON_VISION_MODEL")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ollama".to_string());
+        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let openai_api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        let openai_base = std::env::var("OPENAI_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        (
+            ollama_api_key,
+            anthropic_api_key,
+            openai_api_key,
+            openai_base,
+        )
+    }
+
+    /// Ollama/compat base from env only: `ESON_VISION_OLLAMA_URL` →
+    /// `OLLAMA_BASE_URL` → localhost (same order as [`Self::from_env`]).
+    fn ollama_base_from_env() -> String {
+        std::env::var("ESON_VISION_OLLAMA_URL")
+            .ok()
+            .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
+            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string()
+    }
+
+    /// `ESON_VISION_*` / `OLLAMA_VISION_MODEL` / provider defaults — used when
+    /// the desktop did **not** supply a non-empty model string.
+    fn model_from_env_for_provider(provider: VisionProvider) -> String {
+        std::env::var("ESON_VISION_MODEL")
             .ok()
             .or_else(|| std::env::var("OLLAMA_VISION_MODEL").ok())
             .filter(|s| !s.trim().is_empty())
@@ -99,25 +168,70 @@ impl VisionConfig {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| DEFAULT_OPENAI_VISION_MODEL.to_string()),
-            });
-        let ollama_base = std::env::var("ESON_VISION_OLLAMA_URL")
+            })
+    }
+
+    /// Provider from `ESON_VISION_PROVIDER` (same as [`Self::from_env`]).
+    fn provider_from_env() -> VisionProvider {
+        std::env::var("ESON_VISION_PROVIDER")
             .ok()
-            .or_else(|| std::env::var("OLLAMA_BASE_URL").ok())
-            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .to_string();
-        let anthropic_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-        let openai_api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        let openai_base = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        VisionConfig {
+            .as_deref()
+            .and_then(parse_vision_provider)
+            .unwrap_or(VisionProvider::Ollama)
+    }
+
+    /// Build config for a session: **non-empty** Settings values win over
+    /// `ESON_VISION_OLLAMA_URL`, `ESON_VISION_MODEL`, and
+    /// `ESON_VISION_PROVIDER` in `.env` / `.env.local` so the user does not
+    /// have to comment env lines out. Code paths with no session (e.g.
+    /// `scan_images`) still use [`Self::from_env`].
+    pub fn from_session_picks(picks: SessionVisionPicks<'_>) -> Self {
+        let (ollama_api_key, anthropic_api_key, openai_api_key, openai_base) =
+            Self::shared_credentials_from_env();
+
+        // Provider: explicit session tab wins, else env.
+        let provider = picks
+            .provider
+            .and_then(|p| parse_vision_provider(p))
+            .unwrap_or_else(Self::provider_from_env);
+
+        // Model: non-empty session field wins, else ESON_VISION_MODEL chain.
+        let model = match picks
+            .model
+            .map(str::trim)
+            .filter(|m: &&str| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => Self::model_from_env_for_provider(provider),
+        };
+
+        // Ollama/compat base: vision URL, else chat Ollama URL, else full env
+        // (ESON_VISION_OLLAMA_URL first — matches [`from_env`]), else default.
+        let vision_url = picks
+            .vision_ollama_url
+            .map(str::trim)
+            .filter(|u: &&str| !u.is_empty());
+        let chat_url = picks
+            .chat_ollama_url
+            .map(str::trim)
+            .filter(|u: &&str| !u.is_empty());
+        let ollama_base = if let Some(u) = vision_url {
+            u.trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .to_string()
+        } else if let Some(u) = chat_url {
+            u.trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .to_string()
+        } else {
+            Self::ollama_base_from_env()
+        };
+
+        Self {
             provider,
             model,
             ollama_base,
+            ollama_api_key,
             anthropic_api_key,
             openai_api_key,
             openai_base,
@@ -209,7 +323,7 @@ pub fn analyze_image(
 ) -> Result<String, String> {
     cfg.validate()?;
     match cfg.provider {
-        VisionProvider::Ollama => ollama_generate_image(cfg, image_bytes, prompt),
+        VisionProvider::Ollama => ollama_generate_image(cfg, image_bytes, mime, prompt),
         VisionProvider::Anthropic => anthropic_image(cfg, image_bytes, mime, prompt),
         VisionProvider::Openai => openai_image(cfg, image_bytes, mime, prompt),
     }
@@ -232,9 +346,103 @@ pub fn analyze_table(
 
 // ----- Provider implementations -----
 
+/// Match [`crate::llm::OpenAiCompatConfig::from_ollama_env`]: `…/v1` for
+/// `POST …/chat/completions`.
+fn ollama_openai_compat_v1_base(ollama_base: &str) -> String {
+    let t = ollama_base.trim_end_matches('/');
+    if t.ends_with("/v1") {
+        t.to_string()
+    } else {
+        format!("{t}/v1")
+    }
+}
+
+/// OpenAI-compatible multimodal (for hosts with `/v1/chat/completions` only).
+fn ollama_openai_compat_image(
+    cfg: &VisionConfig,
+    image_bytes: &[u8],
+    mime: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let b64 = B64.encode(image_bytes);
+    let data_uri = format!("data:{mime};base64,{b64}");
+    let v1 = ollama_openai_compat_v1_base(&cfg.ollama_base);
+    let body = json!({
+        "model": cfg.model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": data_uri }
+                }
+            ]
+        }],
+        "max_tokens": 4096,
+    });
+    let url = format!("{v1}/chat/completions");
+    let res = blocking_client()
+        .post(&url)
+        .header(
+            "authorization",
+            format!("Bearer {}", cfg.ollama_api_key.trim()),
+        )
+        .json(&body)
+        .send()
+        .map_err(|e| format!("ollama OpenAI-compat vision request failed: {e}"))?;
+    let status = res.status();
+    let body_text = res.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "ollama OpenAI-compat vision HTTP {status}: {body_text}"
+        ));
+    }
+    let v: Value = serde_json::from_str(&body_text)
+        .map_err(|e| format!("ollama OpenAI-compat parse: {e}"))?;
+    let text = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if text.trim().is_empty() {
+        return Err("ollama OpenAI-compat vision returned no text".into());
+    }
+    Ok(text.trim().to_string())
+}
+
+/// After native Ollama `/api/generate` fails (any reason), try OpenAI-shaped
+/// `POST /v1/chat/completions` (Exo, mlx-lm, LM Studio, vLLM, etc.).
+fn ollama_after_native_fail(
+    cfg: &VisionConfig,
+    image_bytes: &[u8],
+    mime: &str,
+    prompt: &str,
+    native_err: &str,
+) -> Result<String, String> {
+    tracing::info!(
+        %native_err,
+        "ollama /api/generate failed; trying OpenAI-compat /v1/chat/completions for vision"
+    );
+    match ollama_openai_compat_image(cfg, image_bytes, mime, prompt) {
+        Ok(s) if !s.trim().is_empty() => Ok(s),
+        Ok(_) => Err(format!(
+            "ollama: native /api/generate failed ({native_err}); OpenAI-compat returned empty text"
+        )),
+        Err(e) => Err(format!(
+            "ollama: native /api/generate failed ({native_err}). OpenAI-compat: {e}"
+        )),
+    }
+}
+
 fn ollama_generate_image(
     cfg: &VisionConfig,
     image_bytes: &[u8],
+    mime: &str,
     prompt: &str,
 ) -> Result<String, String> {
     let b64 = B64.encode(image_bytes);
@@ -245,22 +453,40 @@ fn ollama_generate_image(
         "images": [b64],
         "stream": false,
     });
-    let res = blocking_client()
-        .post(&url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("ollama vision request failed: {e}"))?;
+    // Exo/MLX and other OpenAI-compat stacks often have nothing listening on
+    // Ollama's `/api/generate` — `send()` fails with a transport error *before*
+    // any HTTP status. We must fall back to `/v1/chat/completions` in that case
+    // too, not only on 4xx/5xx *responses*.
+    let res = match blocking_client().post(&url).json(&body).send() {
+        Ok(r) => r,
+        Err(e) => {
+            return ollama_after_native_fail(
+                cfg,
+                image_bytes,
+                mime,
+                prompt,
+                &format!("transport: {e}"),
+            );
+        }
+    };
     let status = res.status();
-    if !status.is_success() {
-        let t = res.text().unwrap_or_default();
-        return Err(format!("ollama vision HTTP {status}: {t}"));
+    let body_text = res.text().unwrap_or_default();
+    if status.is_success() {
+        let v: Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+        return Ok(v
+            .get("response")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string());
     }
-    let v: Value = res.json().map_err(|e| e.to_string())?;
-    Ok(v.get("response")
-        .and_then(|r| r.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string())
+    ollama_after_native_fail(
+        cfg,
+        image_bytes,
+        mime,
+        prompt,
+        &format!("HTTP {status}: {body_text}"),
+    )
 }
 
 fn anthropic_image(

@@ -546,6 +546,8 @@
     ollamaModel?: string;
     visionProvider?: string;
     visionModel?: string;
+    /** Ollama / OpenAI-compat base for vision only; blank → use AI Provider Ollama URL. */
+    visionOllamaUrl?: string;
     /** Per-request HTTP timeout sent to the agent on `/session/message`.
      * Maps to `ProviderSettings.http_timeout_secs` server-side. Empty/0
      * → fall through to `ESON_LLM_HTTP_TIMEOUT_SECS` (default 600 s). */
@@ -594,8 +596,8 @@
     openai: true,
     ollama: true,
   };
-  // `ready` = configured AND reachable. For Ollama the agent does a 1.5 s
-  // TCP/HTTP probe; for cloud providers `ready` mirrors `available`.
+  // `ready` = configured AND reachable. For Ollama the agent does a short
+  // HTTP probe (GET /v1/models, then /); for cloud `ready` mirrors `available`.
   let providerReady: Record<AiProvider, boolean> = {
     anthropic: true,
     openai: true,
@@ -618,6 +620,7 @@
     ? _pf.visionProvider
     : "ollama";
   let visionModel = str(_pf.visionModel);
+  let visionOllamaUrl = str(_pf.visionOllamaUrl);
 
   /** Per-request HTTP timeout in seconds. Sent to the agent in every
    * `/session/message` body so a slow Ollama round can be given more
@@ -656,6 +659,8 @@
     ollamaModel: string;
     visionProvider: VisionProvider;
     visionModel: string;
+    /** Env default for vision Ollama base; blank means inherit chat Ollama URL. */
+    visionOllamaUrl: string;
     /** Text-embeddings routing used by scan_images indexing and the
      * search_images LLM tool. Resolved from ESON_EMBED_* env vars at
      * agent startup — the UI shows the live value so the user can
@@ -677,6 +682,7 @@
     ollamaModel: "",
     visionProvider: "ollama",
     visionModel: "",
+    visionOllamaUrl: "",
     embeddingsProvider: "ollama",
     embeddingsModel: "qwen3-embedding:4b",
     embeddingsBaseUrl: "http://127.0.0.1:11434",
@@ -815,6 +821,7 @@
           ollamaModel,
           visionProvider,
           visionModel,
+          visionOllamaUrl,
           httpTimeoutSecs,
           pendingTurnTimeoutMs,
         }),
@@ -842,6 +849,7 @@
     ollamaModel;
     visionProvider;
     visionModel;
+    visionOllamaUrl;
     httpTimeoutSecs;
     pendingTurnTimeoutMs;
     persistProviderFields();
@@ -864,6 +872,8 @@
       vision: {
         provider: visionProvider || undefined,
         model: visionModel || undefined,
+        // Always send (empty string clears a saved override on the agent).
+        url: visionOllamaUrl,
       },
       // 0/blank → fall through to the agent's `ESON_LLM_HTTP_TIMEOUT_SECS`
       // (default 600 s). Only forward a positive value to keep the body
@@ -890,7 +900,7 @@
           api_key_configured?: boolean;
         };
         ollama?: { url?: string; model?: string };
-        vision?: { provider?: string; model?: string };
+        vision?: { provider?: string; model?: string; url?: string };
         embeddings?: { provider?: string; model?: string; base_url?: string };
       };
       const visionDefault: VisionProvider = isVisionProvider(d.vision?.provider)
@@ -907,6 +917,7 @@
         ollamaModel: str(d.ollama?.model),
         visionProvider: visionDefault,
         visionModel: str(d.vision?.model),
+        visionOllamaUrl: str(d.vision?.url),
         embeddingsProvider: str(d.embeddings?.provider) || "ollama",
         embeddingsModel: str(d.embeddings?.model) || "qwen3-embedding:4b",
         embeddingsBaseUrl: str(d.embeddings?.base_url) || "http://127.0.0.1:11434",
@@ -930,6 +941,8 @@
       // so the env default doesn't override their UI pick on every load.
       if (!visionModel.trim() && providerDefaults.visionModel)
         visionModel = providerDefaults.visionModel;
+      if (!visionOllamaUrl.trim() && providerDefaults.visionOllamaUrl)
+        visionOllamaUrl = providerDefaults.visionOllamaUrl;
     } catch {
       /* ignore */
     }
@@ -988,6 +1001,7 @@
   function resetVisionToDefaults() {
     visionProvider = providerDefaults.visionProvider;
     visionModel = providerDefaults.visionModel;
+    visionOllamaUrl = providerDefaults.visionOllamaUrl;
     pushActivity("info", "Vision provider reset to secrets.env default");
   }
 
@@ -1187,7 +1201,16 @@
 
   async function loadProviderAvailability() {
     try {
-      const r = await fetchWithTimeout(`${agentBase()}/session/providers`);
+      // Same Ollama URL/model the user saved in Settings (localStorage) so the
+      // agent TCP-probes the host chat will use — not only
+      // `OLLAMA_BASE_URL` from the agent’s env.
+      const probe = new URLSearchParams();
+      if (ollamaUrl.trim()) {
+        probe.set("ollama_url", ollamaUrl.trim());
+        if (ollamaModel.trim()) probe.set("ollama_model", ollamaModel.trim());
+      }
+      const q = probe.toString() ? `?${probe.toString()}` : "";
+      const r = await fetchWithTimeout(`${agentBase()}/session/providers${q}`);
       const text = await r.text();
       const parsed = parseJsonBody<{
         available?: Partial<Record<AiProvider, boolean>>;
@@ -1225,14 +1248,16 @@
               ollama: Boolean(parsed.value.ready.ollama),
             }
           : { ...providerAvailability };
-        // Cloud providers: trust a user-supplied key for "ready" too — the
-        // first call will surface auth errors via the Activity panel. We
-        // intentionally do NOT override Ollama readiness from the client
-        // because Ollama needs an actual TCP probe.
+        // Cloud providers: trust a user-supplied key for "ready" for the
+        // auto-switch notice; the first call surfaces auth errors in Activity.
+        // Ollama: same idea — a URL in Settings (localStorage) means we at least
+        // try; the server probe now uses that URL (query) when possible. If an
+        // old agent still returns `ready.ollama: false`, still avoid a spurious
+        // "add a key" notice when a base URL is configured.
         providerReady = {
           anthropic: serverReady.anthropic || localHasKey.anthropic,
           openai: serverReady.openai || localHasKey.openai,
-          ollama: serverReady.ollama,
+          ollama: serverReady.ollama || localHasKey.ollama,
         };
         const fallback: AiProvider | null =
           parsed.value.default && providerReady[parsed.value.default]
@@ -1253,7 +1278,8 @@
       if (p === "openai") return "no OPENAI_API_KEY configured";
       return "no Ollama base URL configured";
     }
-    if (p === "ollama") return "Ollama host did not respond (~1.5 s probe)";
+    if (p === "ollama")
+      return "Ollama host did not answer the quick reachability check (GET /v1/models, then /)";
     return "provider not reachable";
   }
 
@@ -3818,6 +3844,33 @@
               <strong>AI Provider</strong> above (paste a <code>sk-…</code>
               key and click Save), then come back here. The chat and vision
               share the same key.
+            </div>
+          {/if}
+          {#if visionProvider === "ollama"}
+            <div class="provider-fields">
+              <label class="field-label" for="vision-ollama-url">Base URL (vision)</label>
+              <input
+                id="vision-ollama-url"
+                class="field-input"
+                bind:value={visionOllamaUrl}
+                placeholder={providerDefaults.visionOllamaUrl || ollamaUrl || "http://127.0.0.1:11434"}
+              />
+              <div class="field-default">
+                Native Ollama (<code>POST /api/generate</code>) or an OpenAI-compatible
+                host with <code>/v1/chat/completions</code>. Leave blank to use the
+                <strong>Ollama</strong> URL under <strong>AI Provider</strong> above.
+              </div>
+              {#if providerDefaults.visionOllamaUrl && providerDefaults.visionOllamaUrl !== visionOllamaUrl.trim()}
+                <div class="field-default">
+                  Default from <code>secrets.env</code> (<code>ESON_VISION_OLLAMA_URL</code>):
+                  <code>{providerDefaults.visionOllamaUrl}</code>
+                  <button
+                    type="button"
+                    class="field-default-link"
+                    on:click={() => (visionOllamaUrl = providerDefaults.visionOllamaUrl)}
+                  >Use</button>
+                </div>
+              {/if}
             </div>
           {/if}
           <div class="provider-fields">

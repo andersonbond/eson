@@ -370,6 +370,10 @@ struct VisionOverrides {
     /// Model id to send to the chosen provider (e.g. `gemma4:e4b`,
     /// `claude-haiku-4-5-20251001`, `gpt-4o-mini`).
     model: Option<String>,
+    /// When provider is Ollama (or for native + OpenAI-compat vision routes),
+    /// optional base URL **without** requiring `/v1` — same rules as the chat
+    /// Ollama URL. Overrides the AI Provider Ollama URL for vision only.
+    url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -418,9 +422,18 @@ fn merge_provider_settings(target: &mut ProviderSettings, patch: ProviderSetting
     }
     if let Some(p) = patch.vision {
         let cur = target.vision.take().unwrap_or_default();
+        // When the client sends `"url": ""`, clear the override so vision
+        // inherits the chat Ollama URL again (same pattern as an empty
+        // string in the UI).
+        let url = match p.url {
+            None => cur.url,
+            Some(ref s) if s.trim().is_empty() => None,
+            Some(s) => Some(s.trim().to_string()),
+        };
         target.vision = Some(VisionOverrides {
             provider: non_empty_opt(p.provider).or(cur.provider),
             model: non_empty_opt(p.model).or(cur.model),
+            url,
         });
     }
     if let Some(secs) = patch.http_timeout_secs.filter(|n| *n > 0) {
@@ -428,47 +441,17 @@ fn merge_provider_settings(target: &mut ProviderSettings, patch: ProviderSetting
     }
 }
 
-/// Build the per-turn [`vision::VisionConfig`] by overlaying the user's UI
-/// picks (Settings → "Vision") on top of the env-derived defaults. The env
-/// defaults already carry credentials + URLs; the UI only contributes
-/// `provider` and `model`. If the user picks Anthropic / OpenAI but those
-/// keys aren't configured, [`vision::VisionConfig::validate`] will surface a
-/// readable error from the tool layer instead of a confusing HTTP 401.
+/// Build the per-turn [`vision::VisionConfig`]. **Non-empty** values from
+/// Settings (Vision model / Vision URL / chat Ollama URL / Vision provider)
+/// take precedence over `ESON_VISION_*` in `.env` so the user can manage
+/// routing in the app without editing or commenting out env.
 fn vision_config_for_session(settings: &ProviderSettings) -> vision::VisionConfig {
-    let mut cfg = vision::VisionConfig::from_env();
-    if let Some(v) = settings.vision.as_ref() {
-        if let Some(p) = v
-            .provider
-            .as_deref()
-            .and_then(vision::parse_vision_provider)
-        {
-            cfg.provider = p;
-            // Picking a provider with no companion model picks the
-            // provider's canonical default rather than reusing a model
-            // string that only made sense for the previous provider
-            // (e.g. `gemma4:e4b` against the Anthropic API → 404).
-            if v.model.as_deref().unwrap_or("").trim().is_empty() {
-                cfg.model = vision::VisionConfig::default_model_for(p).to_string();
-            }
-        }
-        if let Some(m) = v.model.as_deref() {
-            let m = m.trim();
-            if !m.is_empty() {
-                cfg.model = m.to_string();
-            }
-        }
-    }
-    // Reuse the per-session Ollama URL the user typed under "Ollama" if
-    // they didn't bother re-typing it under "Vision" — same server in 99%
-    // of setups.
-    if let Some(o) = settings.ollama.as_ref() {
-        if let Some(url) = o.url.as_deref() {
-            let url = url.trim();
-            if !url.is_empty() {
-                cfg.ollama_base = url.trim_end_matches('/').trim_end_matches("/v1").to_string();
-            }
-        }
-    }
+    let mut cfg = vision::VisionConfig::from_session_picks(vision::SessionVisionPicks {
+        provider: settings.vision.as_ref().and_then(|v| v.provider.as_deref()),
+        model: settings.vision.as_ref().and_then(|v| v.model.as_deref()),
+        vision_ollama_url: settings.vision.as_ref().and_then(|v| v.url.as_deref()),
+        chat_ollama_url: settings.ollama.as_ref().and_then(|o| o.url.as_deref()),
+    });
     if let Some(a) = settings.anthropic.as_ref() {
         if let Some(k) = a.api_key.as_deref() {
             let k = k.trim();
@@ -1531,11 +1514,13 @@ async fn try_provider(
             let model = client.model().to_string();
             let endpoint = client.endpoint();
             emit_llm_call_begin(state, session_id, &call_id, provider, &model, &endpoint).await;
-            // Fast-fail on an unreachable Ollama host (~1.5 s) instead of
-            // letting the full `ESON_LLM_HTTP_TIMEOUT_SECS` (default 10 min)
-            // reqwest timeout block fallback.
+            // Fast-fail on an unreachable Ollama host (short probe: GET /v1/models,
+            // then GET /) instead of letting the full `ESON_LLM_HTTP_TIMEOUT_SECS`
+            // (default 10 min) reqwest timeout block fallback.
             if !probe_ollama(&client).await {
-                let err = format!("Ollama unreachable at {endpoint} (host did not respond within ~1.5 s)");
+                let err = format!(
+                    "Ollama unreachable (reachability check: GET /v1/models then / — no response within ~5 s). Configured API: {endpoint}"
+                );
                 emit_llm_call_end(state, session_id, &call_id, provider, &model, &endpoint, started, Err(&err)).await;
                 return Err(err);
             }
@@ -2699,6 +2684,30 @@ fn ollama_client_for_session(
     state.ollama.clone()
 }
 
+/// `http://host[:port]` or `https://…` for a reachability fallback when a
+/// server does not implement OpenAI `GET /v1/models` (common on some LAN MLX /
+/// custom stacks that still serve `POST /v1/chat/completions`).
+fn http_scheme_and_authority(url: &str) -> Option<String> {
+    const HTTP: &str = "http://";
+    const HTTPS: &str = "https://";
+    let (prefix, rest) = if let Some(r) = url.strip_prefix(HTTP) {
+        (HTTP, r)
+    } else if let Some(r) = url.strip_prefix(HTTPS) {
+        (HTTPS, r)
+    } else {
+        return None;
+    };
+    let authority = if let Some(i) = rest.find('/') {
+        &rest[..i]
+    } else {
+        rest
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}{authority}"))
+}
+
 /// Quick TCP/HTTP reachability probe for an Ollama base URL.
 ///
 /// Used to flip a configured-but-unreachable Ollama from `ready=true` to
@@ -2707,20 +2716,52 @@ fn ollama_client_for_session(
 /// 600 s, for `reqwest`'s timeout to fire before our chat-time fallback
 /// kicks in).
 async fn probe_ollama(client: &OpenAiCompatClient) -> bool {
-    let endpoint = client.endpoint();
-    let probe_url = endpoint.trim_end_matches("/chat/completions");
-    let probe_url = format!("{probe_url}/models");
+    let chat_endpoint = client.endpoint();
+    let base = chat_endpoint
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/');
+
     let http = match reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(1500))
-        .timeout(std::time::Duration::from_millis(2500))
+        .connect_timeout(std::time::Duration::from_millis(2500))
+        .timeout(std::time::Duration::from_millis(5000))
         .build()
     {
         Ok(c) => c,
         Err(_) => return false,
     };
+
+    let mut candidates: Vec<String> = vec![format!("{base}/models")];
+    if let Some(origin) = http_scheme_and_authority(&chat_endpoint) {
+        let root = format!("{origin}/");
+        if !candidates.iter().any(|u| u == &root) {
+            candidates.push(root);
+        }
+    }
     // Any HTTP response (200, 401, 404, …) means the host answered. Only
     // transport-level errors (DNS / refused / timeout) count as down.
-    http.get(&probe_url).send().await.is_ok()
+    for url in &candidates {
+        if http.get(url).send().await.is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `settings` should include any per-session Ollama URL/model the desktop
+/// typed in Settings (same as `/session/message`); when empty, probes
+/// env-time `OLLAMA_BASE_URL` only — which missed LAN/Exo URLs that only
+/// exist in the UI.
+async fn provider_ready_ollama_with_settings(
+    state: &AppState,
+    settings: &ProviderSettings,
+) -> bool {
+    if !provider_can_message(state, ChatProvider::Ollama, settings) {
+        return false;
+    }
+    match ollama_client_for_session(state, settings) {
+        Some(c) => probe_ollama(&c).await,
+        None => false,
+    }
 }
 
 async fn provider_ready(state: &AppState, p: ChatProvider) -> bool {
@@ -2732,23 +2773,51 @@ async fn provider_ready(state: &AppState, p: ChatProvider) -> bool {
         // Cloud providers: trust the key for the UI gate; the actual call
         // will surface auth failures via the API ✗ Activity row.
         ChatProvider::Anthropic | ChatProvider::Openai => true,
-        ChatProvider::Ollama => match ollama_client_for_session(state, &empty) {
-            Some(c) => probe_ollama(&c).await,
-            None => false,
-        },
+        ChatProvider::Ollama => provider_ready_ollama_with_settings(state, &empty).await,
     }
 }
 
-async fn session_providers(State(state): State<AppState>) -> Json<Value> {
+/// Optional query mirrors the desktop Settings → AI Provider → Ollama fields
+/// so `/session/providers` probes the same host chat will use.
+#[derive(Deserialize, Default)]
+struct SessionProvidersQuery {
+    #[serde(default)]
+    ollama_url: Option<String>,
+    #[serde(default)]
+    ollama_model: Option<String>,
+}
+
+async fn session_providers(
+    State(state): State<AppState>,
+    Query(q): Query<SessionProvidersQuery>,
+) -> Json<Value> {
     let anthropic_avail = state.anthropic.is_some();
     let openai_avail = state.openai.is_some();
     let ollama_avail = state.ollama.is_some();
 
-    let (anthropic_ready, openai_ready, ollama_ready) = tokio::join!(
+    let ollama_probe_settings = if let Some(url) = q
+        .ollama_url
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        ProviderSettings {
+            ollama: Some(OllamaOverrides {
+                model: non_empty_opt(q.ollama_model.clone()),
+                url: Some(url),
+            }),
+            ..Default::default()
+        }
+    } else {
+        ProviderSettings::default()
+    };
+
+    let (anthropic_ready, openai_ready) = tokio::join!(
         provider_ready(&state, ChatProvider::Anthropic),
         provider_ready(&state, ChatProvider::Openai),
-        provider_ready(&state, ChatProvider::Ollama),
     );
+    let ollama_ready =
+        provider_ready_ollama_with_settings(&state, &ollama_probe_settings).await;
 
     // Pick a sensible default the UI can latch onto when the user's
     // persisted choice is dead: prefer whichever ready provider exists in
