@@ -17,9 +17,9 @@ use eson_agent::{
     },
     embedder,
     llm::{
-        anthropic_client_or_none, max_llm_tool_rounds, ollama_client_or_none, openai_client_or_none,
-        provider_ui_defaults, AnthropicClient, AnthropicConfig, ApiMessage, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        anthropic_client_or_none, context_window_tokens_for_model, max_llm_tool_rounds,
+        ollama_client_or_none, openai_client_or_none, provider_ui_defaults, AnthropicClient,
+        AnthropicConfig, ApiMessage, LlmTurnUsage, OpenAiCompatClient, OpenAiCompatConfig,
     },
     memory_client::MemoryClient, os_plane, persona, policy::ConcurrencyPolicy, scan,
     skills::{self, match_inbox_skill},
@@ -87,6 +87,16 @@ fn provider_label(p: ChatProvider) -> &'static str {
         ChatProvider::Openai => "openai",
         ChatProvider::Ollama => "ollama",
     }
+}
+
+/// Result of a successful LLM call (one provider attempt) including usage
+/// telemetry for the chat context bar.
+struct SuccessfulLlmTurn {
+    answer: String,
+    model: String,
+    /// Provider that actually served the turn (after fallbacks, same as requested).
+    provider: ChatProvider,
+    usage: LlmTurnUsage,
 }
 
 fn truncate_preview(s: &str, max_chars: usize) -> String {
@@ -1237,7 +1247,7 @@ async fn execute_llm(
     provider_settings: &ProviderSettings,
     system: &str,
     session_id: &str,
-) -> Result<String, String> {
+) -> Result<SuccessfulLlmTurn, String> {
     let mut tried: Vec<ChatProvider> = Vec::new();
     let mut last_error: Option<String> = None;
 
@@ -1270,7 +1280,7 @@ async fn execute_llm(
         tried.push(candidate);
 
         match try_provider(state, turns, candidate, provider_settings, system, session_id, &cancel).await {
-            Ok(answer) => {
+            Ok(turn) => {
                 if candidate != provider {
                     orchestrator_emit(
                         state,
@@ -1284,7 +1294,7 @@ async fn execute_llm(
                     )
                     .await;
                 }
-                return Ok(answer);
+                return Ok(turn);
             }
             Err(e) => {
                 tracing::warn!(provider = %provider_label(candidate), error = %e, "LLM call failed");
@@ -1306,7 +1316,7 @@ async fn try_provider(
     system: &str,
     session_id: &str,
     cancel: &Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> Result<SuccessfulLlmTurn, String> {
     if cancel.load(Ordering::SeqCst) {
         return Err("cancelled by user".into());
     }
@@ -1321,7 +1331,7 @@ async fn try_provider(
     // reasoning chunks into the right inline step even across provider
     // fallbacks within the same turn.
     let call_id = Uuid::new_v4().to_string();
-    let (model, endpoint, exec): (String, String, _) = match provider {
+    let (model, endpoint, exec): (String, String, Result<SuccessfulLlmTurn, String>) = match provider {
         ChatProvider::Anthropic => {
             let Some(claude) = anthropic_client_for_session(state, provider_settings) else {
                 let err = "Anthropic not configured (ANTHROPIC_API_KEY)".to_string();
@@ -1408,9 +1418,35 @@ async fn try_provider(
                             round,
                         );
                     },
+                    |round| {
+                        emit_llm_reflection_begin(
+                            &round_io,
+                            &round_sid,
+                            &round_call,
+                            "anthropic",
+                            &round_model,
+                            round,
+                        );
+                    },
+                    |delta| {
+                        emit_llm_reflection_delta(
+                            &think_io,
+                            &think_sid,
+                            &think_call,
+                            "anthropic",
+                            &think_model,
+                            delta,
+                        );
+                    },
                 )
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())
+                .map(|(answer, usage)| SuccessfulLlmTurn {
+                    answer,
+                    model: model.clone(),
+                    provider,
+                    usage,
+                });
             (model, endpoint, result)
         }
         ChatProvider::Openai => {
@@ -1499,9 +1535,35 @@ async fn try_provider(
                             round,
                         );
                     },
+                    |round| {
+                        emit_llm_reflection_begin(
+                            &round_io,
+                            &round_sid,
+                            &round_call,
+                            "openai",
+                            &round_model,
+                            round,
+                        );
+                    },
+                    |delta| {
+                        emit_llm_reflection_delta(
+                            &think_io,
+                            &think_sid,
+                            &think_call,
+                            "openai",
+                            &think_model,
+                            delta,
+                        );
+                    },
                 )
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())
+                .map(|(answer, usage)| SuccessfulLlmTurn {
+                    answer,
+                    model: model.clone(),
+                    provider,
+                    usage,
+                });
             (model, endpoint, result)
         }
         ChatProvider::Ollama => {
@@ -1600,13 +1662,52 @@ async fn try_provider(
                             round,
                         );
                     },
+                    |round| {
+                        emit_llm_reflection_begin(
+                            &round_io,
+                            &round_sid,
+                            &round_call,
+                            "ollama",
+                            &round_model,
+                            round,
+                        );
+                    },
+                    |delta| {
+                        emit_llm_reflection_delta(
+                            &think_io,
+                            &think_sid,
+                            &think_call,
+                            "ollama",
+                            &think_model,
+                            delta,
+                        );
+                    },
                 )
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())
+                .map(|(answer, usage)| SuccessfulLlmTurn {
+                    answer,
+                    model: model.clone(),
+                    provider,
+                    usage,
+                });
             (model, endpoint, result)
         }
     };
-    emit_llm_call_end(state, session_id, &call_id, provider, &model, &endpoint, started, exec.as_deref().map_err(String::as_str)).await;
+    emit_llm_call_end(
+        state,
+        session_id,
+        &call_id,
+        provider,
+        &model,
+        &endpoint,
+        started,
+        match &exec {
+            Ok(t) => Ok(t.answer.as_str()),
+            Err(e) => Err(e.as_str()),
+        },
+    )
+    .await;
     exec
 }
 
@@ -1670,6 +1771,53 @@ fn emit_llm_content_delta(
     }
     let payload = json!({
         "kind": "llm_content_delta",
+        "session_id": session_id,
+        "call_id": call_id,
+        "provider": provider,
+        "model": model,
+        "delta": delta,
+    });
+    let io = io.clone();
+    tokio::spawn(async move {
+        let _ = io.emit("orchestrator", &payload).await;
+    });
+}
+
+fn emit_llm_reflection_begin(
+    io: &SocketIo,
+    session_id: &str,
+    call_id: &str,
+    provider: &str,
+    model: &str,
+    round: u32,
+) {
+    let payload = json!({
+        "kind": "llm_reflection_begin",
+        "session_id": session_id,
+        "call_id": call_id,
+        "provider": provider,
+        "model": model,
+        "round": round,
+    });
+    let io = io.clone();
+    tokio::spawn(async move {
+        let _ = io.emit("orchestrator", &payload).await;
+    });
+}
+
+fn emit_llm_reflection_delta(
+    io: &SocketIo,
+    session_id: &str,
+    call_id: &str,
+    provider: &str,
+    model: &str,
+    delta: &str,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "kind": "llm_reflection_delta",
         "session_id": session_id,
         "call_id": call_id,
         "provider": provider,
@@ -1816,11 +1964,10 @@ async fn run_background_llm_turn(state: &AppState, session_id: &str, user_text: 
         return Err("background provider not configured".into());
     }
     let system = build_system_prompt(state, user_text).await;
-    let answer = execute_llm(state, &mut turns, provider, &settings, &system, session_id).await?;
+    let _turn = execute_llm(state, &mut turns, provider, &settings, &system, session_id).await?;
     if let Some(mut s) = state.sessions.get_mut(session_id) {
         s.messages = turns;
     }
-    let _ = answer;
     Ok(())
 }
 
@@ -2465,7 +2612,7 @@ async fn run_session_turn(
     orchestration_start: std::time::Instant,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<String, (StatusCode, String)> {
-    let answer = match execute_llm(
+    let turn: SuccessfulLlmTurn = match execute_llm(
         &state,
         &mut turns,
         provider,
@@ -2475,7 +2622,7 @@ async fn run_session_turn(
     )
     .await
     {
-        Ok(a) => a,
+        Ok(t) => t,
         Err(e) => {
             // If cancellation flipped the flag, prefer a friendly error so
             // the client can show "Stopped" rather than a confusing 502.
@@ -2504,6 +2651,13 @@ async fn run_session_turn(
             return Err((status, err_text));
         }
     };
+    let SuccessfulLlmTurn {
+        answer,
+        model,
+        provider: used_provider,
+        usage,
+    } = turn;
+    let ctx_max = context_window_tokens_for_model(&model);
 
     state.cancellations.remove(&session_id);
 
@@ -2527,6 +2681,13 @@ async fn run_session_turn(
             "ok": true,
             "answer_preview": truncate_preview(&answer, 320),
             "answer": &answer,
+            "context_usage": {
+                "model": &model,
+                "provider": provider_label(used_provider),
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "context_max_tokens": ctx_max,
+            },
         }),
     )
     .await;

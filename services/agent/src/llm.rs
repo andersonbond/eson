@@ -70,6 +70,59 @@ pub fn max_llm_tool_rounds() -> u32 {
         .clamp(1, HARD_CAP)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReflectionMode {
+    Always,
+    OnError,
+}
+
+fn reflection_enabled() -> bool {
+    std::env::var("ESON_AGENT_REFLECTION")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+fn reflection_mode() -> ReflectionMode {
+    match std::env::var("ESON_AGENT_REFLECTION_MODE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("on_error") => ReflectionMode::OnError,
+        _ => ReflectionMode::Always,
+    }
+}
+
+fn should_run_reflection(tool_outputs: &[String]) -> bool {
+    should_run_reflection_for_mode(reflection_enabled(), reflection_mode(), tool_outputs)
+}
+
+fn should_run_reflection_for_mode(
+    enabled: bool,
+    mode: ReflectionMode,
+    tool_outputs: &[String],
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match mode {
+        ReflectionMode::Always => true,
+        ReflectionMode::OnError => tool_outputs
+            .iter()
+            .any(|o| o.trim_start().to_ascii_lowercase().starts_with("error:")),
+    }
+}
+
+fn reflection_nudge_user_text() -> String {
+    "Self-check the just-finished tool results before continuing.\n\
+Respond with exactly these sections:\n\
+1) Outcome: what the tools established.\n\
+2) Correctness: inconsistencies, errors, or unverifiable claims.\n\
+3) GapsAndRisk: missing evidence, edge cases, and confidence level.\n\
+4) NextAction: one concrete next step.\n\
+Keep it concise and actionable.".to_string()
+}
+
 const DEFAULT_OPENAI_BASE: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OLLAMA_BASE: &str = "http://127.0.0.1:11434/v1";
@@ -167,6 +220,66 @@ pub enum AnthropicError {
     ToolLoopLimit(u32),
 }
 
+/// Token usage from a completed model call (or last round in a tool loop).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LlmTurnUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Best-effort max context (prompt budget) for the progress bar. Returns
+/// `None` so the UI can show absolute token counts only.
+pub fn context_window_tokens_for_model(model: &str) -> Option<u64> {
+    let m = model.to_ascii_lowercase();
+    if m.contains("claude") {
+        return Some(200_000);
+    }
+    if m.contains("gpt-4o") {
+        return Some(128_000);
+    }
+    if m.contains("gpt-3.5") {
+        return Some(16_385);
+    }
+    if m.contains("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    if m.contains("o1") || m.contains("o3") || m.contains("gpt-5") {
+        return Some(200_000);
+    }
+    if m.contains("gemma")
+        || m.contains("llama")
+        || m.contains("qwen")
+        || m.contains("mistral")
+        || m.contains("phi")
+        || m.contains("mixtral")
+    {
+        return Some(128_000);
+    }
+    None
+}
+
+fn merge_usage_from_json(usage: &mut LlmTurnUsage, v: &Value) {
+    if let Some(n) = v.get("input_tokens").and_then(|x| x.as_u64()) {
+        usage.input_tokens = Some(n);
+    } else if let Some(n) = v.get("prompt_tokens").and_then(|x| x.as_u64()) {
+        usage.input_tokens = Some(n);
+    }
+    if let Some(n) = v.get("output_tokens").and_then(|x| x.as_u64()) {
+        usage.output_tokens = Some(n);
+    } else if let Some(n) = v.get("completion_tokens").and_then(|x| x.as_u64()) {
+        usage.output_tokens = Some(n);
+    }
+}
+
+fn merge_usage_into(total: &mut LlmTurnUsage, delta: &LlmTurnUsage) {
+    if let Some(n) = delta.input_tokens {
+        total.input_tokens = Some(total.input_tokens.unwrap_or(0).saturating_add(n));
+    }
+    if let Some(n) = delta.output_tokens {
+        total.output_tokens = Some(total.output_tokens.unwrap_or(0).saturating_add(n));
+    }
+}
+
 #[derive(Clone)]
 pub struct AnthropicClient {
     cfg: AnthropicConfig,
@@ -220,11 +333,12 @@ impl AnthropicClient {
         tools: Option<&[Value]>,
         mut on_thinking_delta: T,
         mut on_content_delta: C,
-    ) -> Result<Vec<Value>, AnthropicError>
+    ) -> Result<(Vec<Value>, LlmTurnUsage), AnthropicError>
     where
         T: FnMut(&str),
         C: FnMut(&str),
     {
+        let mut last_usage = LlmTurnUsage::default();
         // Extended thinking adds a `thinking` content block in the
         // response. The budget must stay strictly less than `max_tokens`
         // (Anthropic constraint), so we clamp it here defensively rather
@@ -383,7 +497,12 @@ impl AnthropicClient {
                     "content_block_stop" => {
                         // No-op; we already accumulated everything via deltas.
                     }
-                    "message_delta" | "message_start" | "ping" | "message_stop" => {}
+                    "message_delta" | "message_stop" => {
+                        if let Some(u) = v.get("usage") {
+                            merge_usage_from_json(&mut last_usage, u);
+                        }
+                    }
+                    "message_start" | "ping" => {}
                     "error" => {
                         let msg = v
                             .get("error")
@@ -435,10 +554,10 @@ impl AnthropicClient {
                 _ => {}
             }
         }
-        Ok(content_arr)
+        Ok((content_arr, last_usage))
     }
 
-    pub async fn complete_with_tools<F, T, C, R>(
+    pub async fn complete_with_tools<F, T, C, R, B, D>(
         &self,
         messages: &mut Vec<ApiMessage>,
         system: Option<&str>,
@@ -447,14 +566,19 @@ impl AnthropicClient {
         mut on_thinking_delta: T,
         mut on_content_delta: C,
         mut on_round_begin: R,
-    ) -> Result<String, AnthropicError>
+        mut on_reflection_begin: B,
+        mut on_reflection_delta: D,
+    ) -> Result<(String, LlmTurnUsage), AnthropicError>
     where
         F: FnMut(&str, &Value) -> String,
         T: FnMut(&str),
         C: FnMut(&str),
         R: FnMut(u32),
+        B: FnMut(u32),
+        D: FnMut(&str),
     {
         let max_rounds = max_llm_tool_rounds();
+        let mut total_usage = LlmTurnUsage::default();
         for round in 0..max_rounds {
             // Per-round signal so the caller can surface "API → … round N"
             // in the orchestrator stream. Without this the user sees
@@ -463,7 +587,7 @@ impl AnthropicClient {
             // slow local models looks identical to the agent being hung
             // between the tool finishing and the next response landing.
             on_round_begin(round + 1);
-            let content_arr = self
+            let (content_arr, round_usage) = self
                 .post_messages_stream(
                     messages,
                     system,
@@ -472,6 +596,7 @@ impl AnthropicClient {
                     &mut on_content_delta,
                 )
                 .await?;
+            merge_usage_into(&mut total_usage, &round_usage);
             if content_arr.is_empty() {
                 return Err(AnthropicError::EmptyResponse);
             }
@@ -488,7 +613,7 @@ impl AnthropicClient {
                     role: "assistant".into(),
                     content: json!(text),
                 });
-                return Ok(text);
+                return Ok((text, total_usage));
             }
 
             messages.push(ApiMessage {
@@ -497,6 +622,7 @@ impl AnthropicClient {
             });
 
             let mut tool_results = Vec::new();
+            let mut tool_outputs = Vec::new();
             for block in &content_arr {
                 if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                     continue;
@@ -511,6 +637,7 @@ impl AnthropicClient {
                     .unwrap_or("unknown_tool");
                 let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                 let output = run_tool(name, &input);
+                tool_outputs.push(output.clone());
                 tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": id,
@@ -529,6 +656,30 @@ impl AnthropicClient {
                 role: "user".into(),
                 content: Value::Array(tool_results),
             });
+            if should_run_reflection(&tool_outputs) {
+                on_reflection_begin(round + 1);
+                messages.push(ApiMessage {
+                    role: "user".into(),
+                    content: json!(reflection_nudge_user_text()),
+                });
+                let (reflection_content, reflection_usage) = self
+                    .post_messages_stream(
+                        messages,
+                        system,
+                        None,
+                        &mut on_reflection_delta,
+                        |_delta| {},
+                    )
+                    .await?;
+                merge_usage_into(&mut total_usage, &reflection_usage);
+                let reflection_text = join_text_blocks(&reflection_content);
+                if !reflection_text.trim().is_empty() {
+                    messages.push(ApiMessage {
+                        role: "assistant".into(),
+                        content: json!(reflection_text),
+                    });
+                }
+            }
         }
         Err(AnthropicError::ToolLoopLimit(max_rounds))
     }
@@ -654,12 +805,17 @@ struct ChatReqTools<'a> {
     model: &'a str,
     messages: Vec<Value>,
     max_tokens: u32,
-    tools: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
     /// Always `true` for [`OpenAiCompatClient::complete_with_tools`] — we
     /// stream so reasoning + tool-call args can be surfaced incrementally.
     stream: bool,
+    /// Ask OpenAI-compatible servers to attach `usage` to the final stream
+    /// chunk (ignored by some servers, e.g. older Ollama).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<Value>,
 }
 
 /// Convert Anthropic-style `tools` entries (`name`, `description`, `input_schema`) to OpenAI
@@ -743,7 +899,7 @@ impl OpenAiCompatClient {
         &self,
         messages: Vec<ApiMessage>,
         system: Option<&str>,
-    ) -> Result<String, OpenAiCompatError> {
+    ) -> Result<(String, LlmTurnUsage), OpenAiCompatError> {
         let mut turns = Vec::new();
         if let Some(s) = system {
             turns.push(ChatTurn {
@@ -780,8 +936,13 @@ impl OpenAiCompatClient {
         if !status.is_success() {
             return Err(OpenAiCompatError::Http(status.as_u16(), body_text));
         }
-        let parsed: ChatResp =
+        let v: Value =
             serde_json::from_str(&body_text).map_err(|e| OpenAiCompatError::Http(500, e.to_string()))?;
+        let mut usage = LlmTurnUsage::default();
+        if let Some(u) = v.get("usage") {
+            merge_usage_from_json(&mut usage, u);
+        }
+        let parsed: ChatResp = serde_json::from_value(v).map_err(|e| OpenAiCompatError::Http(500, e.to_string()))?;
         let text = parsed
             .choices
             .into_iter()
@@ -791,7 +952,7 @@ impl OpenAiCompatClient {
         if text.trim().is_empty() {
             return Err(OpenAiCompatError::EmptyResponse);
         }
-        Ok(text)
+        Ok((text, usage))
     }
 
     /// Multi-turn tool loop using OpenAI Chat Completions tool calling
@@ -800,7 +961,7 @@ impl OpenAiCompatClient {
     /// tokens reach the orchestrator as they're generated; the assembled
     /// response is returned as a single string for the existing tool-loop
     /// contract.
-    pub async fn complete_with_tools<F, T, C, R>(
+    pub async fn complete_with_tools<F, T, C, R, B, D>(
         &self,
         messages: &mut Vec<ApiMessage>,
         system: Option<&str>,
@@ -809,12 +970,16 @@ impl OpenAiCompatClient {
         mut on_thinking_delta: T,
         mut on_content_delta: C,
         mut on_round_begin: R,
-    ) -> Result<String, OpenAiCompatError>
+        mut on_reflection_begin: B,
+        mut on_reflection_delta: D,
+    ) -> Result<(String, LlmTurnUsage), OpenAiCompatError>
     where
         F: FnMut(&str, &Value) -> String,
         T: FnMut(&str),
         C: FnMut(&str),
         R: FnMut(u32),
+        B: FnMut(u32),
+        D: FnMut(&str),
     {
         let openai_tools = anthropic_tool_specs_to_openai(tools_anthropic_format);
         if openai_tools.is_empty() {
@@ -828,6 +993,7 @@ impl OpenAiCompatClient {
         );
 
         let max_rounds = max_llm_tool_rounds();
+        let mut total_usage = LlmTurnUsage::default();
         for round in 0..max_rounds {
             // See [`AnthropicClient::complete_with_tools`] for why this
             // exists — surfaces "API → ollama · round 2" so the user can
@@ -838,11 +1004,12 @@ impl OpenAiCompatClient {
                 .post_chat_completions_stream(
                     &url,
                     &oa_messages,
-                    &openai_tools,
+                    Some(&openai_tools),
                     &mut on_thinking_delta,
                     &mut on_content_delta,
                 )
                 .await?;
+            merge_usage_into(&mut total_usage, &stream_out.usage);
 
             // Whichever path produced *something*, decide whether this
             // round closes (final answer) or continues (tool calls).
@@ -871,16 +1038,61 @@ impl OpenAiCompatClient {
                     "content": content_field,
                     "tool_calls": tool_calls_json
                 }));
+                messages.push(ApiMessage {
+                    role: "assistant".into(),
+                    content: json!(stream_out.visible_content),
+                });
 
+                let mut tool_outputs = Vec::new();
                 for tc in &stream_out.tool_calls {
                     let args: Value = serde_json::from_str(tc.arguments.trim())
                         .unwrap_or_else(|_| json!({}));
                     let output = run_tool(tc.name.as_str(), &args);
+                    tool_outputs.push(output.clone());
                     oa_messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": output
                     }));
+                }
+                if !tool_outputs.is_empty() {
+                    messages.push(ApiMessage {
+                        role: "user".into(),
+                        content: json!(tool_outputs.join("\n")),
+                    });
+                }
+                if should_run_reflection(&tool_outputs) {
+                    on_reflection_begin(round + 1);
+                    let reflection_prompt = reflection_nudge_user_text();
+                    oa_messages.push(json!({
+                        "role": "user",
+                        "content": reflection_prompt
+                    }));
+                    messages.push(ApiMessage {
+                        role: "user".into(),
+                        content: json!(reflection_nudge_user_text()),
+                    });
+                    let reflection_out = self
+                        .post_chat_completions_stream(
+                            &url,
+                            &oa_messages,
+                            None,
+                            &mut on_reflection_delta,
+                            |_delta| {},
+                        )
+                        .await?;
+                    merge_usage_into(&mut total_usage, &reflection_out.usage);
+                    let reflection_text = reflection_out.visible_content.trim().to_string();
+                    if !reflection_text.is_empty() {
+                        oa_messages.push(json!({
+                            "role": "assistant",
+                            "content": reflection_text.clone()
+                        }));
+                        messages.push(ApiMessage {
+                            role: "assistant".into(),
+                            content: json!(reflection_text),
+                        });
+                    }
                 }
                 continue;
             }
@@ -893,7 +1105,7 @@ impl OpenAiCompatClient {
                 role: "assistant".into(),
                 content: json!(text.clone()),
             });
-            return Ok(text);
+            return Ok((text, total_usage));
         }
         Err(OpenAiCompatError::ToolLoopLimit(max_rounds))
     }
@@ -910,7 +1122,7 @@ impl OpenAiCompatClient {
         &self,
         url: &str,
         oa_messages: &[Value],
-        openai_tools: &[Value],
+        openai_tools: Option<&[Value]>,
         mut on_thinking_delta: T,
         mut on_content_delta: C,
     ) -> Result<StreamedRound, OpenAiCompatError>
@@ -923,8 +1135,12 @@ impl OpenAiCompatClient {
             messages: oa_messages.to_vec(),
             max_tokens: self.cfg.max_tokens,
             tools: openai_tools,
-            tool_choice: Some(json!("auto")),
+            tool_choice: Some(match openai_tools {
+                Some(_) => json!("auto"),
+                None => json!("none"),
+            }),
             stream: true,
+            stream_options: Some(json!({ "include_usage": true })),
         };
         let res = self
             .http
@@ -942,6 +1158,7 @@ impl OpenAiCompatClient {
 
         let mut think_parser = ThinkStreamParser::default();
         let mut tool_calls: BTreeMap<u64, StreamedToolCall> = BTreeMap::new();
+        let mut stream_usage = LlmTurnUsage::default();
         let mut byte_stream = res.bytes_stream();
         let mut buf = String::new();
         'outer: while let Some(chunk) = byte_stream.next().await {
@@ -970,6 +1187,9 @@ impl OpenAiCompatClient {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                if let Some(u) = v.get("usage") {
+                    merge_usage_from_json(&mut stream_usage, u);
+                }
                 let choice = v
                     .get("choices")
                     .and_then(|c| c.as_array())
@@ -1063,6 +1283,7 @@ impl OpenAiCompatClient {
         Ok(StreamedRound {
             visible_content: think_parser.take_visible(),
             tool_calls: tool_calls.into_values().collect(),
+            usage: stream_usage,
         })
     }
 }
@@ -1071,6 +1292,7 @@ impl OpenAiCompatClient {
 struct StreamedRound {
     visible_content: String,
     tool_calls: Vec<StreamedToolCall>,
+    usage: LlmTurnUsage,
 }
 
 #[derive(Default)]
@@ -1367,4 +1589,37 @@ pub fn provider_ui_defaults(expose_secrets: bool) -> Value {
             "base_url": embed_base,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflection_prompt_has_required_sections() {
+        let p = reflection_nudge_user_text();
+        assert!(p.contains("Outcome"));
+        assert!(p.contains("Correctness"));
+        assert!(p.contains("GapsAndRisk"));
+        assert!(p.contains("NextAction"));
+    }
+
+    #[test]
+    fn reflection_on_error_triggers_only_for_error_outputs() {
+        assert!(should_run_reflection_for_mode(
+            true,
+            ReflectionMode::OnError,
+            &["error: tool failed".to_string()],
+        ));
+        assert!(!should_run_reflection_for_mode(
+            true,
+            ReflectionMode::OnError,
+            &["ok".to_string()],
+        ));
+        assert!(!should_run_reflection_for_mode(
+            false,
+            ReflectionMode::Always,
+            &["error: tool failed".to_string()],
+        ));
+    }
 }

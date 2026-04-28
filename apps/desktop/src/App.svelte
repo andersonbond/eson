@@ -180,6 +180,7 @@
   }
 
   const STORAGE_META = "eson_chat_meta_v1";
+  const STORAGE_CONTEXT_USAGE = "eson_context_usage_v1";
   const msgsKey = (id: string) => `eson_msgs_${id}`;
 
   type Role = "user" | "assistant";
@@ -430,6 +431,95 @@
   $: loading = !!activeSessionId && pendingTurns.has(activeSessionId);
   let agentOk = false;
 
+  type SessionContextUsage = {
+    model: string;
+    provider: string;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    contextMaxTokens: number | null;
+  };
+  function readContextUsageStore(): Record<string, SessionContextUsage> {
+    if (typeof localStorage === "undefined") return {};
+    try {
+      const raw = localStorage.getItem(STORAGE_CONTEXT_USAGE);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object") return {};
+      const out: Record<string, SessionContextUsage> = {};
+      for (const [sid, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!sid || !value || typeof value !== "object") continue;
+        const v = value as Record<string, unknown>;
+        out[sid] = {
+          model: typeof v.model === "string" ? v.model : "",
+          provider: typeof v.provider === "string" ? v.provider : "",
+          inputTokens: typeof v.inputTokens === "number" ? v.inputTokens : null,
+          outputTokens: typeof v.outputTokens === "number" ? v.outputTokens : null,
+          contextMaxTokens:
+            typeof v.contextMaxTokens === "number" ? v.contextMaxTokens : null,
+        };
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  function persistContextUsageStore() {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(
+        STORAGE_CONTEXT_USAGE,
+        JSON.stringify(contextUsageBySession),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  let contextUsageBySession: Record<string, SessionContextUsage> = readContextUsageStore();
+  $: chatContextUsage = activeSessionId
+    ? contextUsageBySession[activeSessionId] ?? null
+    : null;
+
+  function formatKTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+    if (n >= 10_000) return `${(n / 1000).toFixed(1)}k`;
+    if (n >= 1000) return `${(n / 1000).toFixed(2)}k`;
+    return String(Math.round(n));
+  }
+
+  function formatContextUsageLine(c: SessionContextUsage): string {
+    const inTok = c.inputTokens;
+    const maxT = c.contextMaxTokens;
+    const outTok = c.outputTokens;
+    const parts: string[] = [];
+    if (inTok != null && maxT != null && maxT > 0) {
+      const pct = ((inTok / maxT) * 100).toFixed(1);
+      parts.push(
+        `${pct}% — ${formatKTokens(inTok)} / ${formatKTokens(maxT)} content used`,
+      );
+    } else if (inTok != null) {
+      parts.push(`~${formatKTokens(inTok)} tok in (context)`);
+    }
+    if (outTok != null) {
+      parts.push(`${formatKTokens(outTok)} out`);
+    }
+    return parts.join(" · ");
+  }
+
+  function contextUsagePercent(c: SessionContextUsage | null): number | null {
+    if (!c) return null;
+    if (c.inputTokens == null || c.contextMaxTokens == null || c.contextMaxTokens <= 0) {
+      return null;
+    }
+    const pct = (c.inputTokens / c.contextMaxTokens) * 100;
+    if (!Number.isFinite(pct)) return null;
+    return Math.max(0, Math.min(100, pct));
+  }
+
+  $: chatContextPct = contextUsagePercent(chatContextUsage);
+  $: chatContextRingStyle = `--pct: ${(chatContextPct ?? 0).toFixed(1)};`;
+
   /** Line from agent `GET /system/health` (host running eson-agent). */
   let systemStatsText = "";
   let systemStatsReady = false;
@@ -528,6 +618,9 @@
   const contentAccum = new Map<string, string>();
   const CONTENT_ACCUM_MAX = 4000;
   const CONTENT_ACCUM_PREVIEW = 180;
+  const reflectionAccum = new Map<string, string>();
+  const REFLECTION_ACCUM_MAX = 4000;
+  const REFLECTION_ACCUM_PREVIEW = 180;
 
   let socket: Socket | null = null;
 
@@ -577,6 +670,83 @@
   const _pf = readProviderFieldsFromStorage();
   const str = (v: unknown) => (typeof v === "string" ? v : "");
 
+  type OllamaHistoryEntry = { url: string; model: string };
+  const OLLAMA_HISTORY_STORAGE = "eson_ollama_history_v1";
+  const OLLAMA_HISTORY_MAX = 8;
+
+  function ollamaPairKey(u: string, m: string) {
+    return `${u.trim().replace(/\/+$/, "")}\0${m.trim()}`;
+  }
+
+  function readOllamaHistory(): OllamaHistoryEntry[] {
+    if (typeof localStorage === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(OLLAMA_HISTORY_STORAGE);
+      if (!raw) return [];
+      const j = JSON.parse(raw) as unknown;
+      if (!Array.isArray(j)) return [];
+      const out: OllamaHistoryEntry[] = [];
+      for (const item of j) {
+        if (!item || typeof item !== "object") continue;
+        const u = (item as { url?: unknown }).url;
+        const m = (item as { model?: unknown }).model;
+        if (typeof u !== "string" || typeof m !== "string") continue;
+        const tu = u.trim();
+        const tm = m.trim();
+        if (!tu || !tm) continue;
+        out.push({ url: tu, model: tm });
+      }
+      return out.slice(0, OLLAMA_HISTORY_MAX);
+    } catch {
+      return [];
+    }
+  }
+
+  function writeOllamaHistoryEntries(entries: OllamaHistoryEntry[]) {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(
+        OLLAMA_HISTORY_STORAGE,
+        JSON.stringify(entries.slice(0, OLLAMA_HISTORY_MAX)),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  let ollamaHistory: OllamaHistoryEntry[] = readOllamaHistory();
+
+  function pushOllamaToHistory(url: string, model: string) {
+    const u = url.trim();
+    const m = model.trim();
+    if (!u || !m) return;
+    const key = ollamaPairKey(u, m);
+    const prev = readOllamaHistory();
+    const filtered = prev.filter((e) => ollamaPairKey(e.url, e.model) !== key);
+    const next = [{ url: u, model: m }, ...filtered].slice(0, OLLAMA_HISTORY_MAX);
+    writeOllamaHistoryEntries(next);
+    ollamaHistory = next;
+  }
+
+  function removeOllamaHistoryIndex(i: number) {
+    if (i < 0 || i >= ollamaHistory.length) return;
+    const next = ollamaHistory.filter((_, j) => j !== i);
+    writeOllamaHistoryEntries(next);
+    ollamaHistory = next;
+  }
+
+  function truncateOllamaUrlForList(s: string, max: number) {
+    if (s.length <= max) return s;
+    const half = Math.max(4, Math.floor((max - 1) / 2));
+    return `${s.slice(0, half)}…${s.slice(s.length - half)}`;
+  }
+
+  function applyOllamaFromHistory(entry: OllamaHistoryEntry) {
+    ollamaUrl = entry.url;
+    ollamaModel = entry.model;
+    void loadProviderAvailability();
+  }
+
   let aiProvider: AiProvider =
     typeof localStorage !== "undefined" &&
     ["anthropic", "openai", "ollama"].includes(
@@ -613,6 +783,9 @@
   let openaiApiKey = str(_pf.openaiApiKey);
   let ollamaUrl = str(_pf.ollamaUrl);
   let ollamaModel = str(_pf.ollamaModel);
+  if (ollamaUrl.trim() && ollamaModel.trim()) {
+    pushOllamaToHistory(ollamaUrl, ollamaModel);
+  }
   // Vision routing — independent of chat provider so a user can chat with
   // Anthropic while still letting Ollama handle multimodal locally (or vice
   // versa). Empty values fall through to the agent's `secrets.env` defaults.
@@ -835,6 +1008,7 @@
    * After saving we re-probe provider availability so a freshly-fixed
    * Ollama URL (or new key) flips its `ready` state without restart. */
   function saveProviderSettings() {
+    pushOllamaToHistory(ollamaUrl, ollamaModel);
     persistProviderFields();
     pushActivity("ok", "AI provider settings saved");
     void loadProviderAvailability();
@@ -2129,6 +2303,39 @@
         text: `Generating · ${prov} · ${model}\n  ${orchOneLine(delta, 200)}`,
       };
     }
+    if (k === "llm_reflection_begin") {
+      const prov = String(d.provider ?? "?");
+      const model = String(d.model ?? "?");
+      const round = typeof d.round === "number" ? d.round : "?";
+      return {
+        kind: "info",
+        text: `Self-check · ${prov} · ${model} · round ${round}`,
+      };
+    }
+    if (k === "llm_reflection_delta") {
+      const prov = String(d.provider ?? "?");
+      const model = String(d.model ?? "?");
+      const callId = typeof d.call_id === "string" ? (d.call_id as string) : "";
+      const delta = typeof d.delta === "string" ? (d.delta as string) : "";
+      if (callId) {
+        const prev = reflectionAccum.get(callId) ?? "";
+        const next = (prev + delta).slice(-REFLECTION_ACCUM_MAX);
+        reflectionAccum.set(callId, next);
+        const tail = orchOneLine(
+          next.slice(-REFLECTION_ACCUM_PREVIEW),
+          REFLECTION_ACCUM_PREVIEW,
+        );
+        return {
+          kind: "info",
+          text: `Self-check · ${prov} · ${model}\n  …${tail}`,
+          coalesceKey: `reflection:${callId}`,
+        };
+      }
+      return {
+        kind: "info",
+        text: `Self-check · ${prov} · ${model}\n  ${orchOneLine(delta, 200)}`,
+      };
+    }
     if (k === "provider_fallback") {
       const req = String(d.requested ?? "?");
       const using = String(d.using ?? "?");
@@ -2290,6 +2497,26 @@
             ? (o.answer_preview as string)
             : "";
         resolvePendingTurn(sid, answer, false);
+        const rawCu = o.context_usage;
+        if (typeof sid === "string" && sid && rawCu && typeof rawCu === "object") {
+          const cu = rawCu as Record<string, unknown>;
+          contextUsageBySession = {
+            ...contextUsageBySession,
+            [sid]: {
+              model: typeof cu.model === "string" ? cu.model : "",
+              provider: typeof cu.provider === "string" ? cu.provider : "",
+              inputTokens:
+                typeof cu.input_tokens === "number" ? cu.input_tokens : null,
+              outputTokens:
+                typeof cu.output_tokens === "number" ? cu.output_tokens : null,
+              contextMaxTokens:
+                typeof cu.context_max_tokens === "number"
+                  ? cu.context_max_tokens
+                  : null,
+            },
+          };
+          persistContextUsageStore();
+        }
       } else if (kind === "turn_error") {
         const err = typeof o.error === "string" ? o.error : "Unknown error";
         resolvePendingTurn(
@@ -2358,6 +2585,7 @@
         if (callId) {
           thinkingAccum.delete(callId);
           contentAccum.delete(callId);
+          reflectionAccum.delete(callId);
         }
         appendStepToPending(sid, (steps) => {
           // Match by call_id first (most precise) and fall back to the
@@ -2557,6 +2785,59 @@
                 id: crypto.randomUUID(),
                 kind: "thinking",
                 headline: `Thinking · ${provider} · ${model}`,
+                pending: true,
+                thinking: delta,
+                callId: callId || undefined,
+              },
+            ];
+          }
+          const updated = [...steps];
+          const existing = updated[idx];
+          updated[idx] = {
+            ...existing,
+            thinking: (existing.thinking ?? "") + delta,
+          };
+          return updated;
+        });
+        scrollToBottomIfPinned();
+      } else if (kind === "llm_reflection_begin") {
+        const provider = String(o.provider ?? "?");
+        const model = String(o.model ?? "?");
+        const round = typeof o.round === "number" ? (o.round as number) : 1;
+        const callId = typeof o.call_id === "string" ? (o.call_id as string) : undefined;
+        appendStepToPending(sid, (steps) => [
+          ...steps,
+          {
+            id: crypto.randomUUID(),
+            kind: "thinking",
+            headline: `Self-check · ${provider} · ${model} · round ${round}`,
+            pending: true,
+            thinking: "",
+            callId,
+          },
+        ]);
+      } else if (kind === "llm_reflection_delta") {
+        const provider = String(o.provider ?? "?");
+        const model = String(o.model ?? "?");
+        const callId = typeof o.call_id === "string" ? (o.call_id as string) : "";
+        const delta = typeof o.delta === "string" ? (o.delta as string) : "";
+        if (!delta) return;
+        appendStepToPending(sid, (steps) => {
+          const idx = callId
+            ? steps.findIndex(
+              (s) =>
+                s.kind === "thinking" &&
+                s.callId === callId &&
+                (s.headline ?? "").startsWith("Self-check · "),
+            )
+            : -1;
+          if (idx === -1) {
+            return [
+              ...steps,
+              {
+                id: crypto.randomUUID(),
+                kind: "thinking",
+                headline: `Self-check · ${provider} · ${model}`,
                 pending: true,
                 thinking: delta,
                 callId: callId || undefined,
@@ -3299,6 +3580,42 @@
             {:else}
               <span class="chat-sys-muted">System metrics unavailable</span>
             {/if}
+            <span class="chat-context-inline">
+              <span
+                class="chat-context-ring"
+                style={chatContextRingStyle}
+                aria-hidden="true"
+              >
+                <span class="chat-context-ring-inner">
+                  {chatContextPct != null ? `${Math.round(chatContextPct)}%` : "?"}
+                </span>
+              </span>
+              <span class="chat-context-inline-label">
+                Context window
+              </span>
+            </span>
+          </p>
+          <p
+            class="chat-context-usage"
+            title="Prompt (input) token usage from the last completed turn; max context is a best-effort estimate for this model name."
+          >
+            {#if chatContextUsage}
+              {#if chatContextUsage.model}
+                <span class="chat-context-model">{chatContextUsage.model}</span>
+                <span class="chat-context-sep" aria-hidden="true">·</span>
+              {/if}
+              {#if chatContextUsage.inputTokens != null || chatContextUsage.contextMaxTokens != null}
+                {formatContextUsageLine(chatContextUsage)}
+              {:else}
+                <span class="chat-sys-muted"
+                  >No token usage reported for this turn (some local endpoints omit it).</span
+                >
+              {/if}
+            {:else}
+              <span class="chat-sys-muted"
+                >Context usage will appear after this chat's next completed turn.</span
+              >
+            {/if}
           </p>
           {#if !agentOk}
             <p class="chat-warn">
@@ -3620,6 +3937,57 @@
                   <button type="button" class="field-default-link" on:click={() => (ollamaModel = providerDefaults.ollamaModel)}>Use</button>
                 </div>
               {/if}
+              <div
+                class="ollama-history"
+                role="group"
+                aria-label="Recent Ollama base URLs and model names"
+              >
+                <div class="ollama-history-header">
+                  <span class="ollama-history-title">Recent</span>
+                  <span class="ollama-history-sub">
+                    Up to {OLLAMA_HISTORY_MAX} pairs stored on this device. Click a row to
+                    apply; use <strong>Save</strong> to add the current fields.
+                  </span>
+                </div>
+                {#if ollamaHistory.length === 0}
+                  <p class="ollama-history-empty">
+                    None yet. Enter a URL and model, then click <strong>Save</strong>
+                    to save it here.
+                  </p>
+                {:else}
+                  <ul class="ollama-history-list">
+                    {#each ollamaHistory as entry, i (ollamaPairKey(entry.url, entry.model) + String(i))}
+                      <li
+                        class="ollama-history-item"
+                        class:ollama-history-item-active={ollamaPairKey(ollamaUrl, ollamaModel) ===
+                          ollamaPairKey(entry.url, entry.model)}
+                      >
+                        <button
+                          type="button"
+                          class="ollama-history-apply"
+                          on:click={() => applyOllamaFromHistory(entry)}
+                          title="Use {entry.url} with {entry.model}"
+                        >
+                          <span class="ollama-history-url"
+                            >{truncateOllamaUrlForList(entry.url, 52)}</span
+                          >
+                          <span class="ollama-history-sep" aria-hidden="true">·</span>
+                          <code class="ollama-history-model-code">{entry.model}</code>
+                        </button>
+                        <button
+                          type="button"
+                          class="ollama-history-remove"
+                          on:click|stopPropagation={() => removeOllamaHistoryIndex(i)}
+                          title="Remove from recent"
+                          aria-label="Remove this recent Ollama URL and model"
+                        >
+                          ×
+                        </button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
               {#if !ollamaInstall.installed}
                 <div class="provider-save-row ollama-install-row">
                   <button
@@ -4945,6 +5313,69 @@
     letter-spacing: 0.02em;
   }
 
+  .chat-context-usage {
+    margin: 0.35rem 0 0;
+    font-size: 0.72rem;
+    font-family: var(--wash-mono);
+    line-height: 1.45;
+    color: var(--wash-text, inherit);
+    max-width: 42rem;
+  }
+
+  .chat-context-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-left: 0.75rem;
+    vertical-align: middle;
+  }
+
+  .chat-context-inline-label {
+    font-size: 0.72rem;
+    color: var(--wash-muted);
+    letter-spacing: 0.01em;
+  }
+
+  .chat-context-ring {
+    --ring-size: 2rem;
+    width: var(--ring-size);
+    height: var(--ring-size);
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      conic-gradient(
+        var(--wash-accent, #6d7cff) calc(var(--pct, 0) * 1%),
+        color-mix(in oklab, var(--wash-border, #8b8b94) 60%, transparent) 0
+      );
+  }
+
+  .chat-context-ring-inner {
+    width: calc(var(--ring-size) - 0.4rem);
+    height: calc(var(--ring-size) - 0.4rem);
+    border-radius: 999px;
+    background: var(--wash-bg, #0f1115);
+    border: 1px solid var(--wash-border, rgba(120, 120, 120, 0.3));
+    font-size: 0.58rem;
+    font-family: var(--wash-mono);
+    color: var(--wash-text, inherit);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+
+  .chat-context-model {
+    color: var(--wash-muted);
+    font-size: 0.7em;
+  }
+
+  .chat-context-sep {
+    margin: 0 0.2rem;
+    opacity: 0.45;
+  }
+
   .chat-sys-muted {
     color: var(--wash-muted);
     font-style: normal;
@@ -5135,10 +5566,10 @@
 
   .reasoning {
     margin: 0 0 0.55rem;
-    border: 1px solid color-mix(in srgb, var(--wash-border, rgba(0, 0, 0, 0.08)) 50%, transparent);
-    border-radius: 8px;
+    border: none;
+    border-radius: 0;
     background: transparent;
-    overflow: hidden;
+    overflow: visible;
   }
 
   .reasoning-toggle {
@@ -5184,7 +5615,7 @@
     list-style: none;
     margin: 0;
     padding: 0.2rem 0.7rem 0.55rem;
-    border-top: 1px solid var(--wash-border, rgba(0, 0, 0, 0.06));
+    border-top: none;
   }
 
   .reasoning-step {
@@ -5872,6 +6303,122 @@
     font-size: 0.78rem;
     color: var(--wash-muted);
     line-height: 1.4;
+  }
+
+  .ollama-history {
+    margin-top: 0.9rem;
+    padding: 0.6rem 0.75rem 0.65rem;
+    border-radius: 8px;
+    border: 1px solid var(--wash-border, rgba(120, 120, 120, 0.28));
+    background: var(--wash-code-bg, rgba(0, 0, 0, 0.03));
+  }
+
+  .ollama-history-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .ollama-history-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--wash-fg, inherit);
+  }
+
+  .ollama-history-sub {
+    font-size: 0.7rem;
+    line-height: 1.4;
+    color: var(--wash-muted);
+  }
+
+  .ollama-history-empty {
+    margin: 0.1rem 0 0;
+    font-size: 0.72rem;
+    line-height: 1.45;
+    color: var(--wash-muted);
+  }
+
+  .ollama-history-list {
+    list-style: none;
+    margin: 0.35rem 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .ollama-history-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.35rem;
+  }
+
+  .ollama-history-item-active .ollama-history-apply {
+    border-color: var(--wash-border-strong, #a1a1aa);
+    background: var(--wash-hover, rgba(0, 0, 0, 0.04));
+  }
+
+  .ollama-history-apply {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.2rem 0.35rem;
+    text-align: left;
+    padding: 0.4rem 0.55rem;
+    font-size: 0.72rem;
+    line-height: 1.4;
+    border: 1px solid var(--wash-border, rgba(120, 120, 120, 0.35));
+    border-radius: 6px;
+    background: var(--wash-card-bg, rgba(255, 255, 255, 0.4));
+    color: var(--wash-fg, inherit);
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+
+  .ollama-history-apply:hover {
+    background: var(--wash-hover, rgba(0, 0, 0, 0.05));
+  }
+
+  .ollama-history-url {
+    flex: 1 1 12rem;
+    min-width: 0;
+    word-break: break-all;
+  }
+
+  .ollama-history-sep {
+    flex: 0 0 auto;
+    opacity: 0.55;
+  }
+
+  .ollama-history-model-code {
+    font-size: 0.7rem;
+    font-family: var(--wash-mono);
+  }
+
+  .ollama-history-remove {
+    flex: 0 0 1.5rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    line-height: 1;
+    font-size: 1rem;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--wash-muted);
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+
+  .ollama-history-remove:hover {
+    color: var(--wash-fg, inherit);
+    background: var(--wash-hover, rgba(0, 0, 0, 0.08));
   }
 
   .ollama-install-row {
